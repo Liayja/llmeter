@@ -1,0 +1,57 @@
+# ═══════════════════════════════════════════════════
+# 多场景压测配置文件
+# 用法: python bench.py scenarios -f config/scenarios.yaml
+#
+# 参数优先级（从高到低）:
+#   场景内的值 (scenarios[].xxx)  >  defaults  >  顶层公共值
+# ═══════════════════════════════════════════════════
+
+# ── 公共参数（所有场景共享）──────────────────────────
+base_url: https://api.deepseek.com
+api_key: sk-your-key-here
+model: deepseek-v4-pro
+output_dir: bench_results
+
+# ── 默认参数（场景未指定时使用）──────────────────────
+defaults:
+  concurrency: 10
+  requests: 100
+  timeout: 30
+  temperature: 0.7
+  stream: true
+  max_tokens: 256
+
+# ── 场景列表 ───────────────────────────────────────
+# 每个场景可覆盖上面的任意参数
+# 注意: prompt_file 路径相对于项目根目录（不是 config/ 目录）
+scenarios:
+
+  # ① 输入长度分级：对比 TTFT / Prefill 性能（输出固定 256）
+  - name: 短输入
+    prompt_file: prompts/short.txt
+    max_tokens: 256
+
+  - name: 中输入
+    prompt_file: prompts/medium.txt
+    max_tokens: 256
+
+  - name: 长输入
+    prompt_file: prompts/long.txt
+    max_tokens: 256
+
+  # ② 真实业务场景：各自使用合适的 max_tokens
+  - name: 智能客服
+    prompt_file: prompts/biz-customer-service.txt
+    concurrency: 20
+    requests: 200
+    max_tokens: 200
+
+  - name: 翻译
+    prompt_file: prompts/biz-translation.txt
+    max_tokens: 300
+
+  - name: 代码生成
+    prompt_file: prompts/biz-code-generation.txt
+    requests: 50
+    max_tokens: 1024
+    timeout: 60

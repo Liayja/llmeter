@@ -1,0 +1,25 @@
+# ═══════════════════════════════════════════════════
+# llmeter 压测配置文件
+# 用法: python bench.py chat -f config/config.yaml
+# 命令行参数优先级高于配置文件
+# ═══════════════════════════════════════════════════
+
+# ── 必填 ──────────────────────────────────────────
+base_url: https://api.openai.com       # API 基础 URL
+api_key: sk-your-key-here              # API Key
+model: gpt-4o                          # 模型名称
+
+# ── 压测参数 ───────────────────────────────────────
+concurrency: 10                        # 并发数
+requests: 100                          # 总请求数
+timeout: 30                            # 单请求超时（秒）
+max_tokens: 2048                       # 最大生成 token 数
+temperature: 0.7                       # 温度
+stream: false                          # 是否流式响应
+
+# ── Prompt ────────────────────────────────────────
+prompt: "Hello, world!"                # 压测 Prompt（与 prompt_file 二选一）
+# prompt_file: prompts/short.txt        # 从文件加载 Prompt
+
+# ── 输出 ──────────────────────────────────────────
+output_dir: bench_results              # 结果保存目录
