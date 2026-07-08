@@ -1,0 +1,14 @@
+请详细解释 Transformer 架构的完整工作原理。要求覆盖以下所有内容：
+
+1. **自注意力机制（Self-Attention）**：详细推导 Q、K、V 的计算过程，包括缩放点积注意力的数学公式和直观含义。
+2. **多头注意力（Multi-Head Attention）**：解释为什么需要多个注意力头，每个头学习什么，以及如何合并多头输出。
+3. **位置编码（Positional Encoding）**：推导正弦位置编码的公式，对比可学习位置编码的优缺点。
+4. **前馈神经网络（Feed-Forward Network）**：说明两层 MLP 的结构、激活函数选择（ReLU/GELU）以及中间维度的作用。
+5. **层归一化（Layer Normalization）**：解释 Pre-Norm 和 Post-Norm 的区别，以及为什么现代 Transformer 普遍使用 Pre-Norm。
+6. **残差连接（Residual Connection）**：说明残差连接如何缓解梯度消失，以及它在深层网络中的必要性。
+7. **完整的前向传播流程**：以一段具体的输入文本为例，逐步走完整体的计算流程。
+8. **训练过程**：包括损失函数（交叉熵）、优化器（AdamW）、学习率调度（Warmup + Cosine Decay）、标签平滑等技巧。
+9. **推理过程**：自回归生成、KV Cache 原理、Beam Search 和 Sampling 策略。
+10. **实际代码示例**：用 PyTorch 给出一个简化但完整的 Transformer Block 实现。
+
+每个部分都需要足够的细节和公式推导，确保读者能够从零理解并实现一个 Transformer。

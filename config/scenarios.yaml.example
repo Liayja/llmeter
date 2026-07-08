@@ -1,18 +1,27 @@
-# ═══════════════════════════════════════════════════
-# 多场景压测配置文件
-# 用法: python bench.py scenarios -f config/scenarios.yaml
+# ═══════════════════════════════════════════════════════════
+# 多场景压测配置文件（三维矩阵版 · 示例）
+# 用法:
+#   python bench.py scenarios -f config/scenarios.yaml              # 跑全部
+#   python bench.py scenarios -f config/scenarios.yaml -s "输入-"   # 只跑输入梯度组
+#   python bench.py scenarios -f config/scenarios.yaml -s "输出-"   # 只跑输出梯度组
+#   python bench.py scenarios -f config/scenarios.yaml -s "业务-"   # 只跑业务验证组
+#   python bench.py scenarios -f config/scenarios.yaml -s "输入-短,业务-代码生成"  # 精确挑选
 #
 # 参数优先级（从高到低）:
-#   场景内的值 (scenarios[].xxx)  >  defaults  >  顶层公共值
-# ═══════════════════════════════════════════════════
+#   场景内的值  >  defaults  >  顶层公共值
+#
+# 💡 多模型对比：如需一次跑「多个模型 × 同一批场景」，见
+#    config/models-comparison.yaml.example（用 models: 列表，各模型自带推理开关）。
+# 🔐 密钥安全：api_key 支持 ${ENV_VAR} 环境变量注入，勿把明文密钥写进配置文件。
+# ═══════════════════════════════════════════════════════════
 
-# ── 公共参数（所有场景共享）──────────────────────────
+# ── 公共参数（所有场景共享）────────────────────────────────
 base_url: https://api.deepseek.com
 api_key: sk-your-key-here
 model: deepseek-v4-pro
 output_dir: bench_results
 
-# ── 默认参数（场景未指定时使用）──────────────────────
+# ── 默认参数（场景未指定时使用）────────────────────────────
 defaults:
   concurrency: 10
   requests: 100
@@ -21,37 +30,103 @@ defaults:
   stream: true
   max_tokens: 256
 
-# ── 场景列表 ───────────────────────────────────────
-# 每个场景可覆盖上面的任意参数
-# 注意: prompt_file 路径相对于项目根目录（不是 config/ 目录）
+# ── 场景列表 ──────────────────────────────────────────────
 scenarios:
 
-  # ① 输入长度分级：对比 TTFT / Prefill 性能（输出固定 256）
-  - name: 短输入
+  # ╔══════════════════════════════════════════════════════╗
+  # ║ 第一维：输入长度梯度 — 测 Prefill / TTFT 扩展性   ║
+  # ║ 固定 output=256, C=10，5 个档位覆盖 10~20000t      ║
+  # ╚══════════════════════════════════════════════════════╝
+  - name: 输入-短(10t)
     prompt_file: prompts/short.txt
     max_tokens: 256
+    requests: 800
 
-  - name: 中输入
+  - name: 输入-中(250t)
     prompt_file: prompts/medium.txt
     max_tokens: 256
+    requests: 500
 
-  - name: 长输入
+  - name: 输入-长(2000t)
     prompt_file: prompts/long.txt
     max_tokens: 256
-
-  # ② 真实业务场景：各自使用合适的 max_tokens
-  - name: 智能客服
-    prompt_file: prompts/biz-customer-service.txt
-    concurrency: 20
     requests: 200
-    max_tokens: 200
 
-  - name: 翻译
+  - name: 输入-超长(8000t)
+    prompt_file: prompts/input-ultra-long.txt
+    max_tokens: 256
+    requests: 50
+    timeout: 60
+
+  - name: 输入-极长(20000t)
+    prompt_file: prompts/input-extreme-long.txt
+    max_tokens: 256
+    requests: 15
+    timeout: 120
+
+  # ╔══════════════════════════════════════════════════════╗
+  # ║ 第二维：输出长度梯度 — 测 Decode / TPOT 稳定性    ║
+  # ║ 固定 input 为对应 prompt，C=10，仅变化输出长度      ║
+  # ╚══════════════════════════════════════════════════════╝
+  - name: 输出-1024
+    prompt_file: prompts/output-1024.txt
+    max_tokens: 1024
+    requests: 300
+    timeout: 60
+
+  - name: 输出-4096
+    prompt_file: prompts/output-4096.txt
+    max_tokens: 4096
+    requests: 100
+    timeout: 120
+    concurrency: 5
+
+  - name: 输出-8192
+    prompt_file: prompts/output-8192.txt
+    max_tokens: 8192
+    requests: 30
+    timeout: 180
+    concurrency: 3
+
+  # ╔══════════════════════════════════════════════════════╗
+  # ║ 第三维：真实业务场景验证                          ║
+  # ╚══════════════════════════════════════════════════════╝
+  - name: 业务-智能客服
+    prompt_file: prompts/biz-customer-service.txt
+    max_tokens: 200
+    requests: 200
+
+  - name: 业务-翻译
     prompt_file: prompts/biz-translation.txt
     max_tokens: 300
+    requests: 200
 
-  - name: 代码生成
+  - name: 业务-代码生成
     prompt_file: prompts/biz-code-generation.txt
-    requests: 50
     max_tokens: 1024
+    requests: 100
     timeout: 60
+
+  # ╔══════════════════════════════════════════════════════╗
+  # ║ extra_params 用法示例 — 透传任意厂商自定义字段       ║
+  # ╚══════════════════════════════════════════════════════╝
+  # DeepSeek V4 Pro：控制推理强度
+  # - name: 推理-deepseek-low
+  #   extra_params:
+  #     reasoning_effort: low
+  #
+  # - name: 推理-deepseek-high
+  #   extra_params:
+  #     reasoning_effort: high
+  #
+  # 阿里 QwQ / 通义：开启深度思考
+  # - name: 推理-qwq
+  #   extra_params:
+  #     enable_thinking: true
+  #
+  # Anthropic Claude 扩展思考（Extended Thinking）
+  # - name: 推理-claude
+  #   extra_params:
+  #     thinking:
+  #       type: enabled
+  #       budget_tokens: 8000

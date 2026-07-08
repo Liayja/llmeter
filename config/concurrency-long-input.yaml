@@ -1,0 +1,102 @@
+# ═══════════════════════════════════════════════════════════
+# 高并发 × 长文本输入 压测配置
+#
+# 目标:测服务端 prefill/注意力计算在高并发下的可扩展性。
+# 设计要点:
+#   1. 输入长(extreme-long ~4.5k token),输出短(max_tokens=64),
+#      把信号集中在 prefill 阶段,避免 decode 时间淹没数据。
+#   2. 并发梯度 1→80,找 TTFT 拐点。C=1 是基线。
+#   3. requests = 并发 × 20,保证每个并发档跑足够轮次,
+#      让 QPS/TTFT 进入稳态(否则 ramp-up 占比过高,数据失真)。
+#
+# 用法:
+#   python bench.py scenarios -f config/concurrency-long-input.yaml            # 全部
+#   python bench.py scenarios -f config/concurrency-long-input.yaml -s "并发-"  # 只看并发扩展曲线
+#   python bench.py scenarios -f config/concurrency-long-input.yaml -s "输入-"  # 只看输入长度敏感度
+#
+# 注意:base_url / api_key / model 请替换为你的实际值。
+# ═══════════════════════════════════════════════════════════
+
+base_url: https://api.your-provider.com
+api_key: sk-your-key-here
+model: your-model-name
+output_dir: bench_results
+
+defaults:
+  concurrency: 10
+  requests: 200
+  timeout: 60          # 流式下 read 间隔超时,长 prefill 不会被误杀
+  temperature: 0.0     # 压测取 0,消除采样随机性,结果可复现
+  stream: true         # 必须流式,否则测不到 TTFT
+  max_tokens: 64       # 输出刻意压短,隔离 prefill 信号
+
+scenarios:
+
+  # ─────────────────────────────────────────────────────────
+  # 第一组:并发扩展曲线(固定长输入,扫并发)
+  # 固定 input=extreme-long(~4.5k token),输出 64 token,
+  # 扫并发 1→80,观察 TTFT 随并发的变化。
+  # C=1 是无竞争基线,后续档位与它对比算"并发劣化倍数"。
+  # ─────────────────────────────────────────────────────────
+  - name: 并发-C1
+    prompt_file: prompts/input-extreme-long.txt
+    concurrency: 1
+    requests: 20       # 单并发,少量请求即可得稳定基线
+
+  - name: 并发-C5
+    prompt_file: prompts/input-extreme-long.txt
+    concurrency: 5
+    requests: 100
+
+  - name: 并发-C10
+    prompt_file: prompts/input-extreme-long.txt
+    concurrency: 10
+    requests: 200
+
+  - name: 并发-C20
+    prompt_file: prompts/input-extreme-long.txt
+    concurrency: 20
+    requests: 400
+
+  - name: 并发-C40
+    prompt_file: prompts/input-extreme-long.txt
+    concurrency: 40
+    requests: 800
+
+  - name: 并发-C80
+    prompt_file: prompts/input-extreme-long.txt
+    concurrency: 80
+    requests: 1600
+    timeout: 120        # 高并发下 prefill 排队更久,放宽 read 间隔超时
+
+  # ─────────────────────────────────────────────────────────
+  # 第二组:输入长度敏感度(固定并发,扫输入长度)
+  # 固定 C=20,扫 short→extreme-long,看输入长度对 TTFT 的影响。
+  # 与第一组正交,组合起来是完整的 2D 画像。
+  # ─────────────────────────────────────────────────────────
+  - name: 输入-短
+    prompt_file: prompts/short.txt
+    concurrency: 20
+    requests: 400
+
+  - name: 输入-中
+    prompt_file: prompts/medium.txt
+    concurrency: 20
+    requests: 400
+
+  - name: 输入-长
+    prompt_file: prompts/long.txt
+    concurrency: 20
+    requests: 400
+
+  - name: 输入-超长
+    prompt_file: prompts/input-ultra-long.txt
+    concurrency: 20
+    requests: 400
+    timeout: 90
+
+  - name: 输入-极长
+    prompt_file: prompts/input-extreme-long.txt
+    concurrency: 20
+    requests: 400
+    timeout: 120

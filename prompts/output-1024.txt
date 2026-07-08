@@ -1,0 +1,7 @@
+请用 Python 实现一个完整的 Redis 协议解析器。要求：
+
+1. 支持 RESP2 协议的全部 5 种数据类型（Simple String、Error、Integer、Bulk String、Array）；
+2. 实现序列化（encode）和反序列化（decode）两个核心方法；
+3. 支持 Null Bulk String 和 Null Array；
+4. 处理协议解析中的边界情况（不完整数据、格式错误等）；
+5. 给出完整的代码、必要的注释和一个演示所有数据类型的测试用例。

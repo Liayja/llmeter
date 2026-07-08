@@ -1,0 +1,90 @@
+# ═══════════════════════════════════════════════════════════
+# 多模型对比压测配置（示例）
+#
+# 核心能力：一次配置，跑「模型 × 场景」笛卡尔积。
+#   - 每个模型在 models: 里自带自己的推理开关(extra_params)，
+#     切换/新增模型无需改动 scenarios，各模型的 thinking /
+#     reasoning_effort 语义互不干扰。
+#   - 报告：① 每个模型各自的分维度对比表；
+#          ② 跨模型对比表（同一场景横向比较所有模型，带「模型」列）。
+#
+# 用法:
+#   export DEEPSEEK_KEY=sk-xxx GLM_KEY=sk-yyy      # 密钥用环境变量注入
+#   python bench.py scenarios -f config/models-comparison.yaml
+#   python bench.py scenarios -f config/models-comparison.yaml -s "输入-"   # 只跑输入梯度
+#   python bench.py scenarios -f config/models-comparison.yaml --excel      # 附带 Excel
+#
+# 参数优先级（从高到低）:
+#   场景 > 模型(models[]) > defaults > 顶层公共值 > 全局默认
+#   extra_params 为「跨层深合并」，同名子键靠后的层覆盖靠前的层。
+# ═══════════════════════════════════════════════════════════
+
+# ── 顶层公共参数（所有模型/场景共享）─────────────────────────
+output_dir: bench_results
+
+# ── 待对比的模型列表 ────────────────────────────────────────
+#   每个模型可覆盖 base_url / api_key / model / extra_params。
+#   name 仅用于报告显示；未写 name 时回退到 model 字段。
+#   ⚠️ 不同模型的推理开关写法不同（参见 docs/模型的参数开关配置.md）：
+#     · DeepSeek V4：thinking.type: disabled 关闭推理
+#     · GLM-5.2：reasoning_effort: none（仅 5.2 支持；5.1/5/4.7 不要写此字段）
+models:
+  - name: deepseek-v4-pro
+    base_url: https://api.deepseek.com
+    api_key: ${DEEPSEEK_KEY}
+    model: deepseek-v4-pro
+    extra_params:
+      thinking:
+        type: disabled              # 关闭推理，保证与其它模型可比
+
+  - name: glm-5.2
+    base_url: https://open.bigmodel.cn/api/paas
+    api_key: ${GLM_KEY}
+    model: glm-5.2
+    extra_params:
+      reasoning_effort: none        # GLM-5.2 专用，跳过思考
+
+  - name: glm-4.7                    # 不支持 reasoning_effort → 不写即可
+    base_url: https://open.bigmodel.cn/api/paas
+    api_key: ${GLM_KEY}
+    model: glm-4.7
+
+# ── 默认参数（场景未指定时使用）────────────────────────────
+defaults:
+  concurrency: 10
+  requests: 100
+  timeout: 60
+  temperature: 0.0                  # 可复现，减少采样噪声
+  stream: true                      # 必须流式才能测 TTFT / ITL
+  max_tokens: 256
+  warmup: 2                         # 预热，剔除首批 TTFT 里的握手时间
+  # http2: false                    # 默认 HTTP/1.1(真并行连接)；并发压测建议保持
+
+# ── 场景列表（所有模型共用同一批场景）──────────────────────
+scenarios:
+  - name: 输入-短
+    prompt_file: prompts/short.txt
+    max_tokens: 256
+
+  - name: 输入-长
+    prompt_file: prompts/long.txt
+    max_tokens: 256
+    requests: 50
+
+  - name: 输出-1024
+    prompt_file: prompts/output-1024.txt
+    max_tokens: 1024
+    timeout: 120
+
+  - name: 业务-代码生成
+    prompt_file: prompts/biz-code-generation.txt
+    max_tokens: 1024
+    timeout: 120
+
+  # 若某场景要单独测「开启推理」对比，可在场景级覆盖 extra_params，
+  # 它会与模型级深合并（场景优先）：
+  # - name: 输入-短-开思考
+  #   prompt_file: prompts/short.txt
+  #   extra_params:
+  #     thinking:
+  #       type: enabled
