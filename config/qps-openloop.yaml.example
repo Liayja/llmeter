@@ -1,0 +1,64 @@
+# ═══════════════════════════════════════════════════════════
+# 开环恒定 QPS 压测配置（open-loop / 固定到达率）· 示例
+#
+# 用法:
+#   cp config/qps-openloop.yaml.example config/qps-openloop.yaml   # 先复制一份再填自己的连接信息
+#   python bench.py scenarios -f config/qps-openloop.yaml            # 全量 QPS 阶梯
+#   python bench.py scenarios -f config/qps-openloop.yaml -s "QPS-4"  # 单独一档
+#   python bench.py scenarios -f config/qps-openloop.yaml -s "QPS-"   # 只跑 QPS 组
+#
+# 与「闭环并发」的区别：
+#   闭环(concurrency): 限制在途 N 个，一个返回才补下一个 —— 测「N 路并发的饱和吞吐」。
+#                      服务器一变慢，客户端自动少发，会低估尾延迟(coordinated omission)。
+#   开环(qps):         按固定速率发车，不等前一个返回 —— 测「稳定 X QPS 流量能否扛住」。
+#                      服务器变慢时请求持续积压，真实暴露排队与尾延迟。
+#
+# 触发条件：场景里出现 qps 即切开环，此时 concurrency 不再限流。
+#   qps + duration → 总请求数 = qps × duration
+#   qps 不带 duration → 发 requests 个请求（仍按 qps 速率发车）
+#
+# 怎么读结果：
+#   看「实际完成 QPS」是否跟得上「目标 QPS」，以及「在途峰值(积压)」。
+#   - 实际 ≈ 目标、积压平稳             → 该 QPS 服务器扛得住
+#   - 实际 < 目标、积压持续攀升、尾延迟炸 → 已过承载上限，这一档就是拐点
+#   建议从低到高扫，找最后一个「实际≈目标且积压不发散」的档位 = 可持续 QPS。
+#
+# 🔐 密钥安全：api_key 支持 ${ENV_VAR} 环境变量注入，建议优先用环境变量而不是明文。
+# ═══════════════════════════════════════════════════════════
+
+# ── 公共参数：改成你自己的服务 ──────────────────────────────
+base_url: https://your-provider.example.com
+api_key: ${LLM_API_KEY}        # 或直接写明文（注意不要提交到 git）
+model: your-model-name
+output_dir: bench_results
+
+# ── 默认参数（各 QPS 档共享）──────────────────────────────
+defaults:
+  prompt_file: prompts/input-3k.txt  # 按需换成更长的 prompt 压 prefill
+  duration: 30                       # 每档持续 30s；总请求数 = qps × duration
+  max_tokens: 256
+  timeout: 60
+  temperature: 1                     # 与线上一致；压测追求可复现时可设 0
+  stream: true                       # 必须流式，否则测不到 TTFT
+  warmup: 2                          # 剔除首批 TTFT 里的 TCP/TLS 握手
+  retries: 0                         # 开环测承载力：重试会掩盖真实失败率，关掉
+  # http2 默认 false(HTTP/1.1)：开环下连接池不设上限，每个请求独立 TCP=真并行。
+
+# ── QPS 阶梯：从低到高，找可持续吞吐拐点 ─────────────────────
+scenarios:
+  - name: QPS-2
+    qps: 2                         # → 60 请求
+    duration: 5
+
+  - name: QPS-4
+    qps: 4                         # → 120 请求
+
+  - name: QPS-8
+    qps: 8                         # → 240 请求
+
+  - name: QPS-16
+    qps: 16                        # → 480 请求
+
+  - name: QPS-32
+    qps: 32                        # → 960 请求；高档大概率开始积压/超时，那正是要找的边界
+    timeout: 120

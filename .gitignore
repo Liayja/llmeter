@@ -5,13 +5,19 @@ __pycache__/
 dist/
 
 # 配置文件（含 API Key，不提交）
-config/config.yaml
-config/scenarios.yaml
-config/sanguo-concurrency.yaml
-config/models-comparison.yaml
+config/*.yaml
+# 例外：已脱敏、可公开的示例配置
+!config/concurrency-long-input.yaml
 
 # 压测结果输出
 bench_results/
+
+# 本地 Web 平台数据（配置库/密钥材料）
+app/data/
+*.db
+
+# 平台化设计文档（仅本地保留，不纳入仓库）
+docs/平台化开发文档.md
 
 # IDE / 编辑器
 .vscode/

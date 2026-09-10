@@ -76,8 +76,29 @@ def _tpot(r: dict) -> float | None:
     return lat / out
 
 
-def aggregate(results: list[dict], wall_time: float) -> dict:
-    """原始结果 → 聚合指标"""
+def _extract_cached_tokens(usage) -> int | None:
+    """从 usage.prompt_tokens_details.cached_tokens 读取缓存命中 token 数。
+
+    返回 int（可能为 0，表示该请求没有命中缓存）；
+    若 API 未返回该字段（无缓存统计能力），返回 None，与「命中 0 个」区分开。
+    """
+    if not isinstance(usage, dict):
+        return None
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict) and "cached_tokens" in details:
+        try:
+            return int(details["cached_tokens"] or 0)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def aggregate(results: list[dict], wall_time: float, *, tpot_mode: str | None = None) -> dict:
+    """原始结果 → 聚合指标
+
+    tpot_mode: "stream" / "nonstream"，用于标注 TPOT 口径——流式剔除 prefill、
+    非流式含 prefill，两者不可直接比较。
+    """
     ok = [r for r in results if r["success"]]
     lat = [r["latency"] for r in ok]
     ttfts = [r["ttft"] for r in ok if r.get("ttft")]
@@ -91,10 +112,20 @@ def aggregate(results: list[dict], wall_time: float) -> dict:
     itl_all: list[float] = []
     for r in ok:
         itl_all.extend(r.get("itl") or [])
+    # ── 失败三分类（对齐 GuideLLM 的 success / incomplete / error）：
+    #    incomplete: 请求未到达服务端或未拿到完整响应（超时/连接中断，status_code=0）
+    #    error:      服务端明确返回 HTTP 4xx/5xx 错误
+    bad = [r for r in results if not r["success"]]
+    incomplete = [r for r in bad if r.get("status_code", 0) == 0]
+    err_resp = [r for r in bad if r.get("status_code", 0) != 0]
+    retried = [r for r in results if r.get("retried")]
     m = {
         "total": len(results),
         "success": len(ok),
-        "fail": len(results) - len(ok),
+        "fail": len(bad),              # 兼容旧字段 = incomplete + error_count
+        "incomplete": len(incomplete), # 超时/连接中断（未完成）
+        "error_count": len(err_resp),  # HTTP 4xx/5xx（服务端明确报错）
+        "retried": len(retried),       # 至少重试过一次的请求数（含最终成功/失败）
         "success_rate": len(ok) / len(results) * 100 if results else 0,
         "qps": len(ok) / wall_time if wall_time > 0 else 0,
         "tps": out_tokens / wall_time if wall_time > 0 else 0,
@@ -107,19 +138,29 @@ def aggregate(results: list[dict], wall_time: float) -> dict:
         "latency_avg": statistics.mean(lat) if lat else 0,
         "latency_std": statistics.stdev(lat) if len(lat) >= 2 else 0,  # 延迟标准差
         "latency_p50": _pct(lat, 50),
+        "latency_p75": _pct(lat, 75),
+        "latency_p90": _pct(lat, 90),
         "latency_p95": _pct(lat, 95),
+        "latency_p98": _pct(lat, 98),
         "latency_p99": _pct(lat, 99),
+        "latency_p999": _pct(lat, 99.9),
         "latency_min": min(lat) if lat else 0,
         "latency_max": max(lat) if lat else 0,
         "errors": [
             {"code": r.get("status_code", 0), "msg": r.get("error", "")[:200]}
-            for r in results if not r["success"]
+            for r in bad
         ][:10],
+        "tpot_mode": tpot_mode or "",
     }
     if ttfts:
         m["ttft_avg"] = statistics.mean(ttfts)
         m["ttft_p50"] = _pct(ttfts, 50)
+        m["ttft_p75"] = _pct(ttfts, 75)
+        m["ttft_p90"] = _pct(ttfts, 90)
         m["ttft_p95"] = _pct(ttfts, 95)
+        m["ttft_p98"] = _pct(ttfts, 98)
+        m["ttft_p99"] = _pct(ttfts, 99)
+        m["ttft_p999"] = _pct(ttfts, 99.9)
     if ttft_answers:
         m["ttft_answer_avg"] = statistics.mean(ttft_answers)
         m["ttft_answer_p50"] = _pct(ttft_answers, 50)
@@ -137,6 +178,25 @@ def aggregate(results: list[dict], wall_time: float) -> dict:
         m["itl_p50"] = _pct(itl_all, 50)
         m["itl_p95"] = _pct(itl_all, 95)
         m["itl_max"] = max(itl_all)
+    # ── Prompt 缓存命中（仅当请求带 cached_tokens 字段才有意义）──
+    # 两个不同口径，分开输出：
+    #   cache_hit_rate          整体（token 加权）= 命中 token 总数 ÷ 上报请求的 prompt 总数
+    #   cache_hit_rate_per_req  平均每请求 = 各请求自身命中率（cached_i/prompt_i）的算术平均
+    # 前者对应成本节约（大头请求权重高），后者反映"平均一个请求能命中多少比例"，
+    # 两者不同，不能混为一谈。假设 cached ⊆ prompt（OpenAI 口径），故封顶 100%。
+    cache_reported = [r for r in ok if r.get("cached_tokens") is not None]
+    if cache_reported:
+        cached_total = sum(r["cached_tokens"] for r in cache_reported)
+        cache_prompt = sum(r.get("input_tokens", 0) for r in cache_reported)
+        per_req = [
+            min(100.0, r["cached_tokens"] / r["input_tokens"] * 100)
+            for r in cache_reported if r.get("input_tokens", 0) > 0
+        ]
+        m["cache_reported_requests"] = len(cache_reported)
+        m["cached_tokens_total"] = cached_total
+        m["cache_prompt_total"] = cache_prompt
+        m["cache_hit_rate"] = min(100.0, cached_total / cache_prompt * 100) if cache_prompt > 0 else 0.0
+        m["cache_hit_rate_per_req"] = statistics.mean(per_req) if per_req else 0.0
     return m
 # ═══════════════════════════════════════
 # 引擎
@@ -149,7 +209,7 @@ class LLMBench:
     """大模型 API 压测引擎"""
     def __init__(self, *, base_url: str, api_key: str, model: str, prompt: str,
                  concurrency: int = 10, total_requests: int = 100,
-                 max_tokens: int = 256, temperature: float = 0.0,
+                 max_tokens: int = 256, temperature: float | None = None,
                  stream: bool = True, timeout: int = 120, output_dir: str = "./results",
                  retries: int = 2, retry_backoff: float = 1.0,
                  read_timeout: float | None = None,
@@ -157,7 +217,10 @@ class LLMBench:
                  verbose: bool = False,
                  extra_params: dict | None = None,
                  http2: bool = False,
-                 warmup: int = 0):
+                 warmup: int = 2,
+                 track_cache: bool = True,
+                 qps: float | None = None,
+                 duration: int | None = None):
         self.base_url = base_url
         self.api_key = api_key
         self.model = model
@@ -177,6 +240,18 @@ class LLMBench:
         self.extra_params = extra_params or {}
         self.http2 = http2
         self.warmup = warmup
+        self.track_cache = track_cache
+        # ── 发压模型：
+        #    qps 未设 → 闭环(closed-loop)：Semaphore 限制在途 concurrency 个，
+        #               一个回来才补下一个，测「N 路并发下的饱和吞吐/延迟」。
+        #    qps 已设 → 开环(open-loop)：按固定到达率发车，不管服务器多慢，
+        #               测「稳定 X QPS 流量下服务器能否扛住」，暴露真实积压与尾延迟
+        #               (规避闭环的 coordinated omission)。
+        self.qps = qps
+        self.duration = duration
+        # 开环 + 指定时长 → 总请求数 = qps × duration（对齐 loadtest 语义）
+        if self.qps and self.duration:
+            self.total_requests = round(self.qps * self.duration)
         self.results: list[dict] = []
         self._verbose_used = False  # 仅首请求打印诊断信息
         # ── 分离超时：connect/write/pool 短(快速发现连接卡死)，
@@ -195,9 +270,9 @@ class LLMBench:
         self._completed = 0
         self._failed = 0
     async def run(self) -> dict:
+        open_loop = bool(self.qps)
         if not self.stream:
             print("⚠️  非流式模式：TTFT / ITL 指标将不可用（非流式 API 无法测量首 token 时间）")
-        sem = asyncio.Semaphore(self.concurrency)
         self.results = []
         self._active = 0
         self._peak = 0
@@ -207,11 +282,19 @@ class LLMBench:
         #    HTTP/2 会把同一 origin 的并发请求多路复用到「一条」TCP 连接上,
         #    并发压测下 N 个"客户端"其实共享一个拥塞窗口,测不出真实并行度。
         #    默认走 HTTP/1.1,让连接池为每个并发请求开独立 TCP 连接(真并行)。
-        #    keepalive 上限同步放大到 concurrency*2,否则空闲连接会被回收后重建。
-        limits = httpx.Limits(
-            max_connections=self.concurrency * 2,
-            max_keepalive_connections=self.concurrency * 2,
-        )
+        # ── 连接池上限:
+        #    闭环: 同步放大到 concurrency*2,否则空闲连接被回收后重建。
+        #    开环: 不设上限(None)。若限制连接数,超额请求会在连接池排队,
+        #          等于把开环退化成闭环——积压被连接池悄悄吸收,测不出真实到达率压力。
+        if open_loop:
+            sem = asyncio.Semaphore(10 ** 9)  # 开环不靠信号量限流,仅用于复用 _active 水位统计
+            limits = httpx.Limits(max_connections=None, max_keepalive_connections=None)
+        else:
+            sem = asyncio.Semaphore(self.concurrency)
+            limits = httpx.Limits(
+                max_connections=self.concurrency * 2,
+                max_keepalive_connections=self.concurrency * 2,
+            )
         async with httpx.AsyncClient(http2=self.http2, limits=limits) as client:
             # ── 预热:先打 warmup 个丢弃请求,把 TCP+TLS 握手和连接池建立
             #    从正式计测的首批 TTFT 中剔除(否则冷连接握手会污染首个 TTFT)。
@@ -226,17 +309,13 @@ class LLMBench:
                 self._failed = 0
             # 后台水位监控：每秒打印完成数/活跃流/峰值/TTFT均值/失败数
             monitor = asyncio.create_task(self._monitor())
+            dispatch_phase = drain_phase = 0.0
             try:
                 gc.disable()
-                t0 = time.perf_counter()
-                tasks = [self._request(client, sem, i) for i in range(self.total_requests)]
-                for coro in asyncio.as_completed(tasks):
-                    r = await coro
-                    self.results.append(r)
-                    self._completed += 1
-                    if not r["success"]:
-                        self._failed += 1
-                wall = time.perf_counter() - t0
+                if open_loop:
+                    dispatch_phase, drain_phase, wall = await self._dispatch_open(client, sem)
+                else:
+                    wall = await self._dispatch_closed(client, sem)
             finally:
                 gc.enable()
                 monitor.cancel()
@@ -244,11 +323,71 @@ class LLMBench:
                     await monitor
                 except asyncio.CancelledError:
                     pass
-        print(f"⏱️  总耗时: {wall:.1f}s  | 并发峰值: {self._peak}/{self.concurrency}")
-        metrics = aggregate(self.results, wall)
+        if open_loop:
+            actual_qps = len(self.results) / wall if wall > 0 else 0
+            print(f"⏱️  总耗时: {wall:.1f}s（发车 {dispatch_phase:.1f}s + 排空 {drain_phase:.1f}s）"
+                  f"  | 目标 {self.qps} QPS → 实际完成 {actual_qps:.2f} req/s"
+                  f"  | 在途峰值(积压): {self._peak}")
+        else:
+            print(f"⏱️  总耗时: {wall:.1f}s  | 并发峰值: {self._peak}/{self.concurrency}")
+        metrics = aggregate(self.results, wall, tpot_mode="stream" if self.stream else "nonstream")
         metrics["concurrency_peak"] = self._peak
-        metrics["concurrency_target"] = self.concurrency
+        if open_loop:
+            metrics["mode"] = "open"
+            metrics["qps_target"] = self.qps
+            metrics["concurrency_target"] = None
+            metrics["dispatch_phase"] = dispatch_phase
+            metrics["drain_phase"] = drain_phase
+            metrics["qps_dispatch"] = len(self.results) / dispatch_phase if dispatch_phase > 0 else 0
+        else:
+            metrics["mode"] = "closed"
+            metrics["concurrency_target"] = self.concurrency
+        if self.track_cache and "cache_reported_requests" not in metrics:
+            print("ℹ️  未检测到 prompt_tokens_details.cached_tokens 字段，缓存命中率不可用"
+                  "（可加 --no-track-cache 关闭采集）")
         return metrics
+
+    async def _run_and_collect(self, client, sem, idx: int) -> dict:
+        """跑一个请求并登记结果 + 更新完成/失败计数（两种模式共用）。"""
+        r = await self._request(client, sem, idx)
+        self.results.append(r)
+        self._completed += 1
+        if not r["success"]:
+            self._failed += 1
+        return r
+
+    async def _dispatch_closed(self, client, sem) -> float:
+        """闭环发压：一次性排入全部请求，靠 Semaphore(concurrency) 限制在途数。"""
+        t0 = time.perf_counter()
+        tasks = [self._run_and_collect(client, sem, i) for i in range(self.total_requests)]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        return time.perf_counter() - t0
+
+    async def _dispatch_open(self, client, sem) -> tuple[float, float, float]:
+        """开环发压：按固定到达率 qps 发车，不等前一个返回。
+
+        用目标时间戳对齐发车(target = t0 + (i+1)/qps)以避免累积漂移；若服务器扛不住、
+        发车已落后进度(sleep<=0)则立即发下一个——积压体现在 _active/_peak 水位上。
+
+        返回 (发车耗时, 排空耗时, 总耗时)：
+        - 发车耗时：从第一个请求到「最后一个请求发出」；
+        - 排空耗时：发完车后等待所有在途请求返回的时间；
+        - 总耗时 = 发车 + 排空，实际完成 QPS = success / 总耗时 会略低于目标到达率，
+          这正是收尾排空的固有开销，报告中分开展示以便区分「发车阶段」与「排空阶段」。
+        """
+        interval = 1.0 / self.qps
+        tasks = []
+        t0 = time.perf_counter()
+        for i in range(self.total_requests):
+            tasks.append(asyncio.create_task(self._run_and_collect(client, sem, i)))
+            target = t0 + (i + 1) * interval
+            sleep = target - time.perf_counter()
+            if sleep > 0:
+                await asyncio.sleep(sleep)
+        dispatch_wall = time.perf_counter() - t0
+        await asyncio.gather(*tasks, return_exceptions=True)
+        total_wall = time.perf_counter() - t0
+        return dispatch_wall, total_wall - dispatch_wall, total_wall
 
     async def _monitor(self):
         """每秒打印并发水位状态（完成数/活跃流/峰值/TTFT均值/失败数）。
@@ -284,21 +423,27 @@ class LLMBench:
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
             "stream": self.stream,
-            **self.extra_params,
         }
+        # temperature 仅在显式配置时发送。部分模型(如 Kimi K3)对 temperature
+        # 有白名单限制(只允许 0.6)，不配置就不发，让服务端用自己的默认值，
+        # 避免被硬塞一个非法温度导致 400。
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        # extra_params 放最后，允许场景/模型级配置覆盖上面的字段
+        payload.update(self.extra_params)
         # stream_options.include_usage 是 OpenAI 扩展字段，用于在流式响应
         # 末尾获取准确 token 数。部分代理/非 OpenAI API 可能不支持，此时
         # token 统计回退到客户端估算（见 count_tokens 注意事项）。
         if self.stream:
             payload["stream_options"] = {"include_usage": True}
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        # api_key 为空时（本地/无需鉴权的自定义服务）不发送 Authorization 头
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         url = f"{self.base_url}/v1/chat/completions"
         last_error = None
+        retried = False  # 本请求是否至少重试过一次（计入 aggregate 的 retried 指标）
         for attempt in range(self.retries + 1):
             async with sem:
                 # 占用并发槽：更新水位计数器（asyncio 单线程，无需锁）
@@ -322,21 +467,26 @@ class LLMBench:
                     self._active -= 1
             # 非重试场景直接返回
             if result["success"]:
+                result["retried"] = retried
                 return result
             if attempt >= self.retries:
+                result["retried"] = retried
                 return result
             # 仅瞬时错误重试（限流/服务端错误/连接失败）
             code = result.get("status_code", 0)
             if code not in _RETRYABLE_CODES and code != 0:
+                result["retried"] = retried
                 return result
             # 退避等待后重试
             last_error = result.get("error", "")
+            retried = True
             await asyncio.sleep(self.retry_backoff * (2 ** attempt))
         return {  # 理论上不会到这里，兜底
             "success": False,
             "latency": 0,
             "error": last_error or "retry exhausted",
             "status_code": 0,
+            "retried": retried,
         }
     async def _stream(self, client, url, payload, headers, t0):
         """流式请求（信号量已由 _request 获取）
@@ -351,6 +501,7 @@ class LLMBench:
         input_tokens = 0
         output_tokens = 0
         reasoning_tokens = 0
+        cached_tokens = None  # prompt 前缀缓存命中的 token 数（仅 track_cache 时采集）
         chunk_count = 0
         # ITL (Inter-Token Latency): 相邻内容 token 之间的间隔
         last_content_t = None
@@ -395,6 +546,8 @@ class LLMBench:
                             chunk_preview = chunk_preview[:400] + "..."
                         print(f"  [verbose] chunk #{chunk_count}: {chunk_preview}")
 
+                    # choices 可能缺失/为空/为 [null]（部分网关的非标准格式），
+                    # 逐层兜底成 {}，避免后续 .get 打到 None。
                     choices = chunk.get("choices") or [{}]
 
                     # 从 usage chunk 提取准确 token 数（OpenAI/DeepSeek stream_options）
@@ -402,10 +555,15 @@ class LLMBench:
                     if usage:
                         output_tokens = usage.get("completion_tokens", 0)
                         input_tokens = usage.get("prompt_tokens", 0)
-                        reasoning_tokens = usage.get("completion_tokens_details", {}).get("reasoning_tokens", 0)
+                        # completion_tokens_details 可能为 null（键存在但值为 None），
+                        # 此时 .get(默认{}) 仍返回 None，需再兜一次。
+                        details = usage.get("completion_tokens_details") or {}
+                        reasoning_tokens = details.get("reasoning_tokens", 0)
+                        if self.track_cache:
+                            cached_tokens = _extract_cached_tokens(usage)
 
                     # 尝试多种内容字段格式
-                    msg = choices[0]
+                    msg = choices[0] or {}
                     content = ""
                     delta = msg.get("delta") or {}
                     if delta:
@@ -459,7 +617,7 @@ class LLMBench:
                 if not input_tokens:
                     input_tokens = count_tokens(self.prompt)
             # TTFT 兜底：无任何 token 时用首个 SSE 事件时间
-            return {
+            res = {
                 "success": True,
                 "latency": time.perf_counter() - t0,
                 "ttft": ttft if ttft is not None else ttfe,
@@ -471,6 +629,9 @@ class LLMBench:
                 "reasoning_tokens": reasoning_tokens,
                 "itl": itl_vals,
             }
+            if self.track_cache:
+                res["cached_tokens"] = cached_tokens
+            return res
         except Exception as e:
             return {
                 "success": False,
@@ -491,12 +652,15 @@ class LLMBench:
                 }
             d = r.json()
             usage = d.get("usage", {})
-            return {
+            res = {
                 "success": True,
                 "latency": t,
                 "input_tokens": usage.get("prompt_tokens", 0),
                 "output_tokens": usage.get("completion_tokens", 0),
             }
+            if self.track_cache:
+                res["cached_tokens"] = _extract_cached_tokens(usage)
+            return res
         except Exception as e:
             return {
                 "success": False,

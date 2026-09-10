@@ -25,12 +25,17 @@ python bench.py scenarios -f config/scenarios.yaml
 
 | 类别 | 指标 |
 |------|------|
-| 基础 | 总请求数、成功数、失败数、成功率 |
+| 基础 | 总请求数、成功数、失败数、**未完成(超时/中断)**、**HTTP错误(4xx/5xx)**、**重试数**、成功率 |
 | 吞吐 | QPS（请求/秒）、TPS（Token/秒） |
-| 延迟 | Avg / P50 / P95 / P99 / Min / Max |
-| TTFT | 首 Token 延迟 Avg / P50 / P95 |
+| 延迟 | Avg / P50 / **P75 / P90** / P95 / **P98** / P99 / **P99.9** / Min / Max |
+| TTFT | 首 Token 延迟 Avg / P50 / **P90** / P95 / **P99 / P99.9**（仅流式） |
 | Token | 输入/输出 Token 总量 |
-| 错误 | 失败请求详情（状态码 + 错误消息） |
+| 缓存 | Prompt 缓存命中率、命中 Token（API 返回 cached_tokens 时自动统计，`--no-track-cache` 关闭） |
+| 错误 | 失败请求详情（状态码 + 错误消息，前 10 条） |
+| 模式 | 开环/闭环、流式/非流式（TPOT 口径标注）、发车/排空两阶段耗时 |
+
+> 默认**流式**（`--no-stream` 显式关闭）并预热 2 个请求；重试后成功的请求会计入成功，
+> 追求真实成功率时可设 `retries: 0` 或参考报告中的「重试」计数。
 
 ## 输出
 
@@ -64,3 +69,4 @@ llmeter/
 - [功能说明](docs/功能说明.md) — 架构、CLI、配置、API 参考
 - [指标手册](docs/metrics.md) — 各指标含义、判读标准
 - [测试场景设计](docs/test-scenarios.md) — 压测方法论与场景设计
+- [开环 vs 闭环压测](docs/open-vs-closed-loop.md) — 两种发压模型的区别、选型与本次更新记录

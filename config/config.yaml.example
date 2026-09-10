@@ -1,0 +1,39 @@
+# ═══════════════════════════════════════════════════
+# llmeter 单次压测配置（示例）
+#
+# 用法:
+#   cp config/config.yaml.example config/config.yaml     # 先复制再填自己的连接信息
+#   python bench.py chat -f config/config.yaml
+#   python bench.py chat -f config/config.yaml -c 50     # 命令行覆盖配置文件
+#
+# 优先级：命令行 > 配置文件 > 内置默认值
+# 🔐 api_key 建议用 ${ENV_VAR} 从环境变量注入，不要提交明文密钥
+# ═══════════════════════════════════════════════════
+
+# ── 必填 ──────────────────────────────────────────
+base_url: https://your-provider.example.com
+api_key: ${LLM_API_KEY}          # 或直接写明文（该文件不要提交到 git）
+model: your-model-name
+
+# ── 压测参数 ───────────────────────────────────────
+concurrency: 10                  # 闭环并发数（设了 qps 则忽略）
+requests: 100                    # 总请求数
+timeout: 30                      # 单请求超时（秒）
+max_tokens: 2048                 # 最大生成 token 数
+temperature: 0.7                 # 温度；压测追求可复现时可设 0
+stream: true                     # 流式响应（TTFT/ITL 仅流式可测）
+warmup: 2                        # 正式计测前的丢弃预热请求数
+retries: 2                       # 瞬时错误重试次数；追求真实成功率时设 0
+track_cache: true                # 采集缓存命中率（依赖 API 返回 cached_tokens）
+verbose: false                   # 打印首个请求的原始 chunk，用于排查解析问题
+
+# ── 开环模式（可选，取消注释即生效）────────────────
+# qps: 8                         # 恒定到达率；设了就切开环，concurrency 不再限流
+# duration: 30                   # 持续秒数；总请求数 = qps × duration
+
+# ── Prompt ────────────────────────────────────────
+prompt: "以春为题写一首五言绝句，要求有意境。"      # 与 prompt_file 二选一
+# prompt_file: prompts/short.txt
+
+# ── 输出 ──────────────────────────────────────────
+output_dir: bench_results

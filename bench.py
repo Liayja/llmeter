@@ -39,8 +39,8 @@ _DEFAULTS = {
     "timeout": 30,
     "output_dir": "bench_results",
     "max_tokens": 2048,
-    "temperature": 0.7,
-    "stream": False,
+    "temperature": None,
+    "stream": True,      # 默认流式：TTFT/ITL 只有流式可测（evalscope 同为默认开）
     "retries": 2,
     "retry_backoff": 1.0,
     "read_timeout": None,
@@ -48,7 +48,10 @@ _DEFAULTS = {
     "verbose": False,
     "extra_params": None,
     "http2": False,
-    "warmup": 0,
+    "warmup": 2,         # 默认预热 2 个请求，剔除冷启动对首批 TTFT 的污染
+    "track_cache": True, # 采集 prompt 缓存命中（依赖 API 返回 cached_tokens 字段）
+    "qps": None,
+    "duration": None,
 }
 
 # 配置文件中的字段名同时也是 argparse dest 名
@@ -57,7 +60,7 @@ _CONF_KEYS = [
     "concurrency", "requests", "timeout", "output_dir",
     "max_tokens", "temperature", "stream", "retries", "retry_backoff",
     "read_timeout", "unique_prefix", "verbose", "extra_params",
-    "http2", "warmup",
+    "http2", "warmup", "track_cache", "qps", "duration",
 ]
 
 # 引擎注册表
@@ -153,6 +156,9 @@ def build_engine_config(raw: dict) -> dict:
         "extra_params": raw.get("extra_params") or None,
         "http2": raw.get("http2", _DEFAULTS["http2"]),
         "warmup": raw.get("warmup", _DEFAULTS["warmup"]),
+        "track_cache": raw.get("track_cache", _DEFAULTS["track_cache"]),
+        "qps": raw.get("qps", _DEFAULTS["qps"]),
+        "duration": raw.get("duration", _DEFAULTS["duration"]),
     }
 
 
@@ -179,8 +185,8 @@ def _merge_extra_params(*layers: dict) -> dict | None:
 
 
 def validate_required(raw: dict) -> None:
-    """校验必填字段"""
-    for key, label in [("api_key", "API Key"), ("base_url", "base-url"), ("model", "model")]:
+    """校验必填字段（api_key 可选：本地/无需鉴权的服务可留空）"""
+    for key, label in [("base_url", "base-url"), ("model", "model")]:
         if not raw.get(key):
             print(f"❌ {label} 不能为空（请通过命令行或配置文件提供）")
             sys.exit(1)
@@ -189,7 +195,15 @@ def validate_required(raw: dict) -> None:
 async def run_one(cfg: dict, engine_type: str, *, save: bool = True) -> dict:
     """运行单个压测，返回 metrics"""
     engine = _ENGINES[engine_type](**cfg)
-    print(f"🚀 压测：{engine_type}/{cfg['model']} 并发={cfg['concurrency']} 请求={cfg['total_requests']}")
+    stream_label = "流式" if cfg.get("stream") else "非流式"
+    if cfg.get("qps"):
+        dur = cfg.get("duration")
+        n = engine.total_requests  # 引擎已按 qps×duration 换算
+        span = f"时长={dur}s→{n}请求" if dur else f"请求={n}"
+        mode_label = f"开环 QPS={cfg['qps']} {span}"
+    else:
+        mode_label = f"并发={cfg['concurrency']} 请求={cfg['total_requests']}"
+    print(f"🚀 压测：{engine_type}/{cfg['model']} {mode_label} | {stream_label}")
     print(f"    Prompt: {cfg['prompt'][:60]}{'...' if len(cfg['prompt']) > 60 else ''}")
 
     metrics = await engine.run()
@@ -335,7 +349,8 @@ async def cmd_scenarios(args: argparse.Namespace) -> int:
     if len(models) == 1:
         # 单模型：保持原有按维度分组的报告
         model = rows[0].get("_model") or "unknown"
-        report_scenarios(rows, model, output_dir, excel=args.excel)
+        report_scenarios(rows, model, output_dir, excel=args.excel,
+                         excel_charts=args.excel_charts)
     else:
         # 多模型：① 每个模型各自的维度报告；② 跨模型对比（按场景分组，带模型列）
         labels = []
@@ -352,7 +367,8 @@ async def cmd_scenarios(args: argparse.Namespace) -> int:
         print(f"\n{'█'*60}")
         print(f"█ 跨模型对比（同场景横向比较 {len(labels)} 个模型）")
         print(f"{'█'*60}")
-        report_scenarios(rows, "跨模型", output_dir, excel=args.excel, show_model=True)
+        report_scenarios(rows, "跨模型", output_dir, excel=args.excel, show_model=True,
+                         excel_charts=args.excel_charts)
 
     # 任一场景有失败则返回非 0
     any_fail = any(r["fail"] > 0 for r in rows)
@@ -360,7 +376,8 @@ async def cmd_scenarios(args: argparse.Namespace) -> int:
 
 
 def report_scenarios(rows: list, model: str, output_dir: str, *,
-                     excel: bool = False, show_model: bool = False) -> None:
+                     excel: bool = False, show_model: bool = False,
+                     excel_charts: bool = False) -> None:
     """按名称前缀（输入-/输出-/并发-/业务-）分组输出对比表。
 
     show_model=True 时在表格最左加一列「模型」，并把同场景不同模型的行排在一起，
@@ -381,46 +398,50 @@ def report_scenarios(rows: list, model: str, output_dir: str, *,
     def _sort(rs: list) -> list:
         return sorted(rs, key=lambda r: (r["name"], r.get("model_label", ""))) if show_model else rs
 
-    # 每个维度独立输出对比表
-    for prefix, group_rows in sorted(groups.items()):
-        group_rows = _sort(group_rows)
-        if len(group_rows) >= 2:
+    # 每个维度独立输出对比表。
+    # 注意：当只有一个维度分组时，分组表 == 总表（内容相同、仅标题差 " — 维度"），
+    # 会生成两份重复文件。此时跳过分组表，只留下总表，避免冗余。
+    if len(groups) > 1:
+        for prefix, group_rows in sorted(groups.items()):
+            group_rows = _sort(group_rows)
             subtitle = f"{model} — {prefix}"
             print_comparison(group_rows, subtitle, show_model=show_model)
             save_comparison(group_rows, subtitle, output_dir, show_model=show_model)
-        else:
-            r = group_rows[0]
-            model_tag = f"[{r.get('model_label')}] " if show_model else ""
-            print(f"\n  [{prefix}] {model_tag}{r['name']}: 成功率 {r['success_rate']:.1f}%  "
-                  f"P50={r['latency_p50']:.3f}s  QPS={r['qps']:.2f}")
 
-    # 多维度时额外输出总对比表
-    if len(groups) >= 2:
-        print_comparison(_sort(rows), model, show_model=show_model)
-        save_comparison(_sort(rows), model, output_dir, show_model=show_model)
+    # 总对比表（含全部场景）。单维度时它是唯一报告，多维度时是全局汇总。
+    print_comparison(_sort(rows), model, show_model=show_model)
+    save_comparison(_sort(rows), model, output_dir, show_model=show_model)
 
     # Excel 报表（可选，面向非技术人员）
     if excel:
         print(f"\n{'─'*60}")
-        print(f"📗 生成 Excel 报表...")
-        save_excel(_sort(rows), groups, model, output_dir, show_model=show_model)
+        chart_note = "（含对比柱状图）" if excel_charts else "（表格版，柱状图默认关闭，可加 --excel-charts）"
+        print(f"📗 生成 Excel 报表{chart_note}...")
+        save_excel(_sort(rows), groups, model, output_dir,
+                   show_model=show_model, charts=excel_charts)
 
 
 def add_common_args(p: argparse.ArgumentParser) -> None:
     """为单次压测子命令添加通用参数"""
     p.add_argument("-f", "--config", default=None, help="配置文件路径 (.yaml / .json)")
     p.add_argument("-b", "--base-url", default=_DEFAULTS["base_url"], help="API 基础 URL")
-    p.add_argument("-k", "--api-key", default=_DEFAULTS["api_key"], help="API Key")
+    p.add_argument("-k", "--api-key", default=_DEFAULTS["api_key"], help="API Key（可留空，适用于无需鉴权的本地/自定义服务）")
     p.add_argument("-m", "--model", default=_DEFAULTS["model"], help="模型名称，如 gpt-4o")
     p.add_argument("-p", "--prompt", default=_DEFAULTS["prompt"], help="压测使用的 Prompt")
     p.add_argument("--prompt-file", default=_DEFAULTS["prompt_file"], help="从文件加载 Prompt，优先级高于 --prompt")
-    p.add_argument("-c", "--concurrency", type=int, default=_DEFAULTS["concurrency"], help="并发数(默认10)")
+    p.add_argument("-c", "--concurrency", type=int, default=_DEFAULTS["concurrency"], help="并发数(默认10)，闭环模式生效；设了 --qps 则忽略")
     p.add_argument("-n", "--requests", type=int, default=_DEFAULTS["requests"], help="总请求数(默认100)")
+    p.add_argument("--qps", type=float, default=_DEFAULTS["qps"],
+                   help="开环恒定到达率(req/s)：按固定速率发车不等返回，测稳定流量压力。"
+                        "设了本项即切到开环模式，此时 --concurrency 不再限流")
+    p.add_argument("--duration", type=int, default=_DEFAULTS["duration"],
+                   help="开环持续秒数；与 --qps 同用时总请求数 = qps×duration（未设则发 -n 个请求）")
     p.add_argument("-t", "--timeout", type=int, default=_DEFAULTS["timeout"], help="单请求超时时间，单位秒")
     p.add_argument("-o", "--output-dir", default=_DEFAULTS["output_dir"], help="结果输出目录")
     p.add_argument("--max-tokens", type=int, default=_DEFAULTS["max_tokens"], help="生成文本的最大 token 数")
     p.add_argument("--temperature", type=float, default=_DEFAULTS["temperature"], help="生成文本的温度")
-    p.add_argument("--stream", action="store_true", help="是否使用流式响应")
+    p.add_argument("--stream", action=argparse.BooleanOptionalAction, default=_DEFAULTS["stream"],
+                   help="是否使用流式响应（默认开启，TTFT/ITL 仅流式可测）；--no-stream 显式关闭")
     p.add_argument("--read-timeout", type=float, default=_DEFAULTS["read_timeout"],
                    help="流式 read 阶段(相邻 chunk 间隔)超时,默认同 --timeout")
     p.add_argument("--unique-prefix", action="store_true", default=_DEFAULTS["unique_prefix"],
@@ -430,6 +451,9 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
                         "并发压测建议保持关闭以获得真实并行连接")
     p.add_argument("--warmup", type=int, default=_DEFAULTS["warmup"],
                    help="正式计测前先打 N 个丢弃请求预热连接,剔除首批 TTFT 中的 TCP/TLS 握手")
+    p.add_argument("--track-cache", action=argparse.BooleanOptionalAction, default=_DEFAULTS["track_cache"],
+                   help="是否采集 Prompt 缓存命中率（依赖 API 返回 prompt_tokens_details.cached_tokens；"
+                        "API 不支持时自动降级并提示）；--no-track-cache 显式关闭")
     p.add_argument("-v", "--verbose", action="store_true", default=_DEFAULTS["verbose"],
                    help="打印首个请求的原始 chunk 格式，用于诊断解析问题")
 
@@ -451,7 +475,9 @@ async def main():
     p_sc.add_argument("-v", "--verbose", action="store_true", default=_DEFAULTS["verbose"],
                       help="打印首个请求的原始 chunk 格式，用于诊断解析问题")
     p_sc.add_argument("--excel", action="store_true",
-                      help="额外生成格式化的 Excel 报表（含图表，适合非技术人员阅读）")
+                      help="额外生成格式化的 Excel 报表（数据表 + 结论摘要；默认不含柱状图）")
+    p_sc.add_argument("--excel-charts", action="store_true",
+                      help="在 Excel 报表中额外生成延迟/QPS/TPS/TTFT 对比柱状图（需与 --excel 同用）")
     p_sc.set_defaults(func=cmd_scenarios)
 
     args = p.parse_args()
