@@ -2,3 +2,4 @@ httpx[http2]>=0.27
 pyyaml>=6.0
 rich>=13.0
 tiktoken>=0.7
+openpyxl>=3.1        # Excel 报表导出（CLI --excel 与平台结果导出）

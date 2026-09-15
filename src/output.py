@@ -144,6 +144,9 @@ def save_results(metrics: dict, raw_results: list, cfg: dict, engine_type: str):
             "engine": engine_type,
             "model": cfg["model"],
             "base_url": cfg["base_url"],
+            # 实际请求地址：排查厂商自定义路径（如智谱 /api/paas/v4/chat/completions）时最有用
+            "endpoint": cfg.get("endpoint"),
+            "chat_url": cfg.get("chat_url"),
             # 发压模式自描述：开环记 qps/duration(并发由服务器决定，无设定值)，闭环记 concurrency。
             "mode": "open" if cfg.get("qps") else "closed",
             "qps": cfg.get("qps") if cfg.get("qps") else None,
@@ -153,6 +156,10 @@ def save_results(metrics: dict, raw_results: list, cfg: dict, engine_type: str):
             "stream": cfg.get("stream"),
             "warmup": cfg.get("warmup"),
             "retries": cfg.get("retries"),
+            # 关键请求参数落盘，便于事后核对"配置是否真的生效"
+            "max_tokens": cfg.get("max_tokens"),
+            "temperature": cfg.get("temperature"),
+            "extra_params": cfg.get("extra_params"),
             "prompt": cfg["prompt"][:200],
             "timestamp": now.isoformat(),
         },
@@ -395,8 +402,11 @@ def _build_excel_col(col_def):
     if header == "成功率":
         return (display_header, getter, getter, '0.0"%"', True, header)
     if header == "缓存命中":
-        # 命中率口径依赖具体请求模式，不做跨场景最优/色阶标注，仅展示数值
-        return (display_header, getter, getter, '0.0"%"', None, header)
+        # 命中率口径依赖具体请求模式，不做跨场景最优/色阶标注，仅展示数值；
+        # API 未返回 cached_tokens 时显示 "—"，避免空白让人误以为漏了指标
+        return (display_header, getter,
+                lambda r: getter(r) if getter(r) is not None else "—",
+                '0.0"%"', None, header)
     if header in ("QPS", "TPS"):
         return (display_header, getter, getter, "0.00" if header == "QPS" else "0.0", True, header)
     if header in ("延迟Avg", "延迟Std", "延迟P50", "延迟P95", "延迟P99"):
@@ -941,7 +951,12 @@ def save_excel(all_rows: list, groups: dict[str, list], model: str, output_dir: 
             c_total = sum(r.get("cached_tokens_total", 0) for r in cache_rows)
             p_total = sum(r.get("cache_prompt_total", 0) for r in cache_rows)
             rate = min(100.0, c_total / p_total * 100) if p_total > 0 else 0.0
-            lines.append(f"💾 缓存命中率：{rate:.1f}%")
+            # 样本量：API 只在成功请求里回传 cached_tokens，若上报数远小于成功数需提示
+            reported = sum(r.get("cache_reported_requests", 0) for r in cache_rows)
+            succeeded = sum(r.get("success", 0) for r in cache_rows)
+            note = f"（{reported}/{succeeded} 个成功请求上报 cached_tokens）" \
+                if reported and reported < succeeded else ""
+            lines.append(f"💾 缓存命中率：{rate:.1f}%{note}")
 
         # 告警：未全部成功的场景
         risky = sorted((r for r in rows if r.get("success_rate", 100) < 100),

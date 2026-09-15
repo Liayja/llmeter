@@ -20,6 +20,97 @@ except ImportError:
 # 默认编码器，用于 token 估算
 _ENCODER = None
 
+# 默认的 Chat Completions 路径；不同厂商的路径不同（如智谱为 /chat/completions）
+DEFAULT_CHAT_PATH = "/v1/chat/completions"
+
+
+def build_chat_url(base_url: str, endpoint: str | None = None) -> str:
+    """拼接 Chat Completions 完整 URL。
+
+    endpoint 为空时用默认 /v1/chat/completions；各厂商路径不同时可显式指定，
+    例如智谱：base_url=https://open.bigmodel.cn/api/paas/v4、endpoint=/chat/completions。
+    另外兼容几种"用户直接粘贴完整地址/只填到 /v1"的写法，避免拼出重复路径。
+    """
+    base = (base_url or "").strip().rstrip("/")
+    path = (endpoint or DEFAULT_CHAT_PATH).strip()
+    if not path.startswith("/"):
+        path = "/" + path
+    # 用户直接粘贴了完整的 chat/completions 地址
+    if base.endswith("/chat/completions"):
+        return base
+    # 显式指定的路径已经包含在 base 末尾
+    if base.endswith(path):
+        return base
+    # base 末尾已含路径首段（如 base=.../v1 + path=/v1/chat/completions，
+    # 或 base=.../v4 + path=/v4/chat/completions）：去掉重复段
+    first_seg = path.strip("/").split("/")[0]
+    if first_seg and base.endswith("/" + first_seg):
+        rest = path[len("/" + first_seg):]
+        return base + (rest or "")
+    return base + path
+
+
+def build_chat_payload(*, model: str, prompt: str, stream: bool = True,
+                       max_tokens: int = 256, temperature: float | None = None,
+                       extra_params: dict | None = None) -> dict:
+    """构造 Chat Completions 请求体。
+
+    压测与「连通性测试/结构调试」共用这一个函数，保证调试时看到的请求体
+    就是压测实际发出的请求体（字段顺序与覆盖规则完全一致）。
+    """
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "stream": stream,
+    }
+    # temperature 仅在显式配置时发送：部分模型对取值有白名单限制，
+    # 不配置就不发，让服务端用自己的默认值。
+    if temperature is not None:
+        payload["temperature"] = temperature
+    # extra_params 放最后，允许场景/模型级配置覆盖上面的字段
+    if extra_params:
+        payload.update(extra_params)
+    # stream_options.include_usage 是 OpenAI 扩展字段，用于在流式响应末尾取准确 usage
+    if stream:
+        payload["stream_options"] = {"include_usage": True}
+    return payload
+
+
+# extra_params 里这些字段必须是数字；写成字符串（如 "max_tokens": "256"）会被
+# 不少网关判为非法类型而**静默忽略**，回落到服务端默认值（常表现为"配置没生效"）。
+_NUMERIC_EXTRA_PARAMS = {
+    "max_tokens": int, "max_completion_tokens": int, "n": int, "seed": int,
+    "best_of": int, "top_k": int, "logprobs": int, "top_logprobs": int,
+    "temperature": float, "top_p": float,
+    "presence_penalty": float, "frequency_penalty": float,
+}
+
+
+def normalize_extra_params(extra_params: dict | None) -> tuple[dict, list[str]]:
+    """规范化 extra_params：数字字符串转数字，返回 (参数, 提示列表)。
+
+    例：{"max_tokens": "256"} → {"max_tokens": 256}，并给出提示；
+    非数字字符串只提示、不改动（交给服务端报错更安全）。
+    """
+    if not extra_params:
+        return {}, []
+    out = dict(extra_params)
+    notes: list[str] = []
+    for key, value in list(out.items()):
+        expected = _NUMERIC_EXTRA_PARAMS.get(key)
+        if expected is None or not isinstance(value, str):
+            continue
+        text = value.strip()
+        try:
+            converted = expected(float(text))
+            out[key] = converted
+            notes.append(f'extra_params.{key} 由字符串 "{text}" 规范化为数字 {converted}'
+                         "（字符串会被多数网关忽略，导致参数不生效）")
+        except ValueError:
+            notes.append(f'extra_params.{key} 的值 "{text}" 不是数字，服务端可能忽略该参数')
+    return out, notes
+
 
 def _get_encoder():
     """延迟加载 tiktoken 编码器"""
@@ -220,7 +311,9 @@ class LLMBench:
                  warmup: int = 2,
                  track_cache: bool = True,
                  qps: float | None = None,
-                 duration: int | None = None):
+                 duration: int | None = None,
+                 endpoint: str | None = None,
+                 on_progress=None):
         self.base_url = base_url
         self.api_key = api_key
         self.model = model
@@ -237,10 +330,21 @@ class LLMBench:
         self.retries = retries
         self.retry_backoff = retry_backoff
         self.verbose = verbose
-        self.extra_params = extra_params or {}
+        # 规范化 extra_params（数字字符串 → 数字），并保留提示供 run() 打印
+        self.extra_params, self._param_notes = normalize_extra_params(extra_params)
         self.http2 = http2
         self.warmup = warmup
         self.track_cache = track_cache
+        # 接口路径：默认 /v1/chat/completions，可按厂商覆盖（如智谱 /chat/completions）
+        self.endpoint = endpoint
+        self.chat_url = build_chat_url(self.base_url, endpoint)
+        # ── 与本地 Web 平台的对接钩子（CLI 不传时行为完全不变）──
+        #   on_progress: 每完成一个请求 / 每秒监控时回调一次 dict；为 None 时走终端打印
+        #   request_cancel(): 置位后不再发起新请求，在途请求自然收尾
+        self._on_progress = on_progress
+        self._cancelled = False
+        self._started_at: float | None = None   # 本轮开始的单调时钟，用于实时速率/ETA
+        self._finish_times: list[float] = []     # 各请求完成时刻，用于滑动窗口速率
         # ── 发压模型：
         #    qps 未设 → 闭环(closed-loop)：Semaphore 限制在途 concurrency 个，
         #               一个回来才补下一个，测「N 路并发下的饱和吞吐/延迟」。
@@ -273,6 +377,20 @@ class LLMBench:
         open_loop = bool(self.qps)
         if not self.stream:
             print("⚠️  非流式模式：TTFT / ITL 指标将不可用（非流式 API 无法测量首 token 时间）")
+        # extra_params 会覆盖顶层字段（设计如此），但静默覆盖极易误判"配置没生效"，
+        # 这里在开跑前把冲突显式打出来。
+        if self.extra_params:
+            base = build_chat_payload(model=self.model, prompt="", stream=self.stream,
+                                      max_tokens=self.max_tokens,
+                                      temperature=self.temperature)
+            conflicts = [f"{k}: {base[k]} → {self.extra_params[k]}"
+                         for k in self.extra_params
+                         if k in base and base[k] != self.extra_params[k]]
+            if conflicts:
+                print("⚠️  extra_params 覆盖了以下参数（实际以覆盖后的值为准）："
+                      + "；".join(conflicts))
+        for note in self._param_notes:
+            print(f"⚠️  {note}")
         self.results = []
         self._active = 0
         self._peak = 0
@@ -307,6 +425,9 @@ class LLMBench:
                 self._peak = 0
                 self._completed = 0
                 self._failed = 0
+            # 计时从预热之后开始：预热请求不产出结果，若计入会低估速率、放大 ETA
+            self._started_at = time.perf_counter()
+            self._finish_times = []
             # 后台水位监控：每秒打印完成数/活跃流/峰值/TTFT均值/失败数
             monitor = asyncio.create_task(self._monitor())
             dispatch_phase = drain_phase = 0.0
@@ -332,6 +453,17 @@ class LLMBench:
             print(f"⏱️  总耗时: {wall:.1f}s  | 并发峰值: {self._peak}/{self.concurrency}")
         metrics = aggregate(self.results, wall, tpot_mode="stream" if self.stream else "nonstream")
         metrics["concurrency_peak"] = self._peak
+        # 服务端是否遵守 max_tokens：只统计拿到 usage 的成功请求，避免本地估算误报
+        over_limit = [r for r in self.results
+                      if r.get("success") and r.get("usage_reported")
+                      and r.get("output_tokens", 0) > self.max_tokens > 0]
+        metrics["max_tokens_requested"] = self.max_tokens
+        metrics["output_tokens_over_limit"] = len(over_limit)
+        metrics["output_tokens_max"] = max((r.get("output_tokens", 0) for r in over_limit), default=0)
+        if over_limit:
+            print(f"⚠️  服务端未遵守 max_tokens：请求上限 {self.max_tokens}，"
+                  f"但有 {len(over_limit)} 个请求输出超过该值（最大 {metrics['output_tokens_max']}）"
+                  "——通常是网关忽略该参数或使用默认上限，建议用「调试」看请求体并向服务商确认")
         if open_loop:
             metrics["mode"] = "open"
             metrics["qps_target"] = self.qps
@@ -345,21 +477,103 @@ class LLMBench:
         if self.track_cache and "cache_reported_requests" not in metrics:
             print("ℹ️  未检测到 prompt_tokens_details.cached_tokens 字段，缓存命中率不可用"
                   "（可加 --no-track-cache 关闭采集）")
+        metrics["canceled"] = self._cancelled
+        if self._on_progress is not None:
+            self._emit_progress(final=True)   # 给 Web 端补一个结束事件（CLI 不输出）
         return metrics
+
+    def request_cancel(self) -> None:
+        """请求中止压测：不再发起新请求，已在途的请求等其自然结束。"""
+        self._cancelled = True
+
+    def _emit_progress(self, final: bool = False) -> None:
+        """上报进度：有 on_progress 回调则回调，否则打印到终端。
+
+        除了完成数/失败数，还给出**实时速率、平均延迟、已用时、ETA**——
+        闭环模式下 active/peak 稳态就等于并发上限，单看这两个数没有信息量，
+        真正有用的是"跑得多快、还要多久"，以及"峰值有没有达到目标并发"。
+        active/peak 仍然保留：开环模式下它们表示在途积压（判断服务器是否扛得住）。
+        """
+        now = time.perf_counter()
+        elapsed = (now - self._started_at) if self._started_at else 0.0
+        ok_results = [r for r in self.results if r.get("success")]
+        ttfts = [r["ttft"] for r in self.results if r.get("ttft") is not None]
+        ttft_avg = statistics.mean(ttfts) if ttfts else None
+        latencies = [r["latency"] for r in ok_results if r.get("latency")]
+        latency_avg = statistics.mean(latencies) if latencies else None
+        # 速率优先用最近 20s 滑动窗口（贴近当前速度）；窗口未填充时退回累计平均。
+        # ETA 在样本太少时不给数，避免开跑初期出现"上千秒"这种误导值。
+        overall_rate = (self._completed / elapsed) if elapsed > 0 and self._completed else 0.0
+        window = 20.0
+        span = min(window, elapsed)
+        recent_count = sum(1 for t in self._finish_times if now - t <= window)
+        rate = (recent_count / span) if span >= 3 and recent_count > 1 else overall_rate
+        remaining = max(self.total_requests - self._completed, 0)
+        eta = (remaining / rate) if rate > 0 and self._completed >= 3 else None
+        payload = {
+            "completed": self._completed,
+            "total": self.total_requests,
+            "failed": self._failed,
+            "active": self._active,
+            "peak": self._peak,
+            "mode": "open" if self.qps else "closed",
+            "concurrency_target": self.concurrency,
+            "qps_target": self.qps,
+            "elapsed": round(elapsed, 2),
+            "rate": round(rate, 2),
+            "rate_overall": round(overall_rate, 2),
+            "eta": round(eta, 1) if eta is not None else None,
+            "avg_latency": latency_avg,
+            "ttft_avg": ttft_avg,
+            "canceled": self._cancelled,
+            "final": final,
+        }
+        if self._on_progress is not None:
+            try:
+                self._on_progress(payload)
+            except Exception:
+                pass  # 回调异常不能影响压测本身
+            return
+        ttft_str = f"{ttft_avg:.2f}s" if ttft_avg is not None else "—"
+        eta_str = f"{eta:.0f}s" if eta is not None else "计算中"
+        if self.qps:
+            # 开环：在途/峰值体现积压，是最关键的信号
+            state = f"在途 {self._active}(峰值 {self._peak})"
+        else:
+            # 闭环：稳态即并发上限；只有没打满时才提示，避免刷屏无意义的 5/5
+            state = (f"并发 {self._active}/{self.concurrency}"
+                     if self._active < self.concurrency else f"并发已满 {self.concurrency}")
+        print(
+            f"  ⏳ {self._completed}/{self.total_requests} | "
+            f"{state} | {rate:.2f} req/s | "
+            f"TTFT {ttft_str} | ETA {eta_str} | 失败 {self._failed}",
+            flush=True,
+        )
 
     async def _run_and_collect(self, client, sem, idx: int) -> dict:
         """跑一个请求并登记结果 + 更新完成/失败计数（两种模式共用）。"""
+        if self._cancelled:
+            return {"success": False, "latency": 0, "error": "canceled",
+                    "status_code": 0, "canceled": True}
         r = await self._request(client, sem, idx)
+        if r.get("canceled"):
+            return r  # 取消导致未发出的请求不登记、不计入完成数
         self.results.append(r)
         self._completed += 1
+        self._finish_times.append(time.perf_counter())
         if not r["success"]:
             self._failed += 1
+        self._emit_progress()
         return r
 
     async def _dispatch_closed(self, client, sem) -> float:
         """闭环发压：一次性排入全部请求，靠 Semaphore(concurrency) 限制在途数。"""
         t0 = time.perf_counter()
-        tasks = [self._run_and_collect(client, sem, i) for i in range(self.total_requests)]
+        tasks = []
+        for i in range(self.total_requests):
+            if self._cancelled:
+                break
+            tasks.append(asyncio.create_task(self._run_and_collect(client, sem, i)))
         await asyncio.gather(*tasks, return_exceptions=True)
         return time.perf_counter() - t0
 
@@ -379,6 +593,8 @@ class LLMBench:
         tasks = []
         t0 = time.perf_counter()
         for i in range(self.total_requests):
+            if self._cancelled:
+                break
             tasks.append(asyncio.create_task(self._run_and_collect(client, sem, i)))
             target = t0 + (i + 1) * interval
             sleep = target - time.perf_counter()
@@ -397,16 +613,8 @@ class LLMBench:
         try:
             while True:
                 await asyncio.sleep(1)
-                # results 在主循环 append，列表推导无 await，单线程下原子读取
-                ttfts = [r["ttft"] for r in self.results if r.get("ttft") is not None]
-                ttft_str = f"{statistics.mean(ttfts):.2f}s" if ttfts else "—"
-                print(
-                    f"  ⏳ {self._completed}/{self.total_requests} | "
-                    f"活跃流 {self._active} | 峰值 {self._peak} | "
-                    f"TTFT均值 {ttft_str} | 失败 {self._failed}",
-                    flush=True,
-                )
-                if self._completed >= self.total_requests:
+                self._emit_progress()
+                if self._completed >= self.total_requests or self._cancelled:
                     break
         except asyncio.CancelledError:
             return
@@ -419,33 +627,24 @@ class LLMBench:
             prompt = f"[req-{nonce}]\n{self.prompt}"
         else:
             prompt = self.prompt
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": self.max_tokens,
-            "stream": self.stream,
-        }
-        # temperature 仅在显式配置时发送。部分模型(如 Kimi K3)对 temperature
-        # 有白名单限制(只允许 0.6)，不配置就不发，让服务端用自己的默认值，
-        # 避免被硬塞一个非法温度导致 400。
-        if self.temperature is not None:
-            payload["temperature"] = self.temperature
-        # extra_params 放最后，允许场景/模型级配置覆盖上面的字段
-        payload.update(self.extra_params)
-        # stream_options.include_usage 是 OpenAI 扩展字段，用于在流式响应
-        # 末尾获取准确 token 数。部分代理/非 OpenAI API 可能不支持，此时
-        # token 统计回退到客户端估算（见 count_tokens 注意事项）。
-        if self.stream:
-            payload["stream_options"] = {"include_usage": True}
+        payload = build_chat_payload(
+            model=self.model, prompt=prompt, stream=self.stream,
+            max_tokens=self.max_tokens, temperature=self.temperature,
+            extra_params=self.extra_params,
+        )
         # api_key 为空时（本地/无需鉴权的自定义服务）不发送 Authorization 头
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        url = f"{self.base_url}/v1/chat/completions"
+        url = self.chat_url
         last_error = None
         retried = False  # 本请求是否至少重试过一次（计入 aggregate 的 retried 指标）
         for attempt in range(self.retries + 1):
             async with sem:
+                # 排队等待期间可能已被取消：拿到槽位后再确认一次，避免继续发请求
+                if self._cancelled:
+                    return {"success": False, "latency": 0, "error": "canceled",
+                            "status_code": 0, "canceled": True}
                 # 占用并发槽：更新水位计数器（asyncio 单线程，无需锁）
                 self._active += 1
                 if self._active > self._peak:
@@ -502,6 +701,7 @@ class LLMBench:
         output_tokens = 0
         reasoning_tokens = 0
         cached_tokens = None  # prompt 前缀缓存命中的 token 数（仅 track_cache 时采集）
+        usage_reported = False  # 是否拿到服务端返回的 usage（判断 token 数是否可信）
         chunk_count = 0
         # ITL (Inter-Token Latency): 相邻内容 token 之间的间隔
         last_content_t = None
@@ -553,6 +753,7 @@ class LLMBench:
                     # 从 usage chunk 提取准确 token 数（OpenAI/DeepSeek stream_options）
                     usage = chunk.get("usage")
                     if usage:
+                        usage_reported = True
                         output_tokens = usage.get("completion_tokens", 0)
                         input_tokens = usage.get("prompt_tokens", 0)
                         # completion_tokens_details 可能为 null（键存在但值为 None），
@@ -628,6 +829,7 @@ class LLMBench:
                 "output_tokens": output_tokens,
                 "reasoning_tokens": reasoning_tokens,
                 "itl": itl_vals,
+                "usage_reported": usage_reported,
             }
             if self.track_cache:
                 res["cached_tokens"] = cached_tokens
@@ -657,6 +859,7 @@ class LLMBench:
                 "latency": t,
                 "input_tokens": usage.get("prompt_tokens", 0),
                 "output_tokens": usage.get("completion_tokens", 0),
+                "usage_reported": bool(usage),
             }
             if self.track_cache:
                 res["cached_tokens"] = _extract_cached_tokens(usage)

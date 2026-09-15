@@ -1,0 +1,4 @@
+# 本地 Web 压测平台依赖（CLI 核心依赖见 requirements.txt）
+# 安装：pip install -r requirements.txt -r requirements-web.txt
+fastapi>=0.115
+uvicorn>=0.30

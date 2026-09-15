@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 dist/
+.venv/
+venv/
+env/
 
 # 配置文件（含 API Key，不提交）
 config/*.yaml
@@ -18,6 +21,8 @@ app/data/
 
 # 平台化设计文档（仅本地保留，不纳入仓库）
 docs/平台化开发文档.md
+# 基准一致性测试设计文档（仅本地保留，不纳入仓库）
+docs/基准一致性测试设计.md
 
 # IDE / 编辑器
 .vscode/

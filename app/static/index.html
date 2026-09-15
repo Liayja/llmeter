@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>llmeter 压测平台</title>
+  <link rel="stylesheet" href="/css/app.css" />
+</head>
+<body>
+  <header>
+    <h1>llmeter <span>压测平台</span></h1>
+    <nav>
+      <button class="tab active" data-tab="run">压测</button>
+      <button class="tab" data-tab="assets">资产库</button>
+      <button class="tab" data-tab="results">结果</button>
+    </nav>
+    <span id="health" class="health">连接中…</span>
+  </header>
+
+  <main>
+    <!-- ── 压测 ─────────────────────────────── -->
+    <section id="tab-run" class="panel active">
+      <div class="cols">
+        <div class="card">
+          <h2>新建压测</h2>
+          <div class="mode-switch">
+            <label><input type="radio" name="run-mode" value="scenarios" checked /> 场景对比（1~N 模型 × 多场景）</label>
+            <label><input type="radio" name="run-mode" value="chat" /> 单次压测（1 模型 · 1 提示词）</label>
+          </div>
+          <div id="chat-block" hidden>
+            <label>模型
+              <select id="run-model"></select>
+            </label>
+          </div>
+          <div id="scenario-block">
+            <label>选择模型（单模型=多场景梯度；多模型=横向对比）</label>
+            <div id="run-models" class="checklist"></div>
+            <label>选择场景（可多选）</label>
+            <div id="run-scenarios" class="checklist"></div>
+          </div>
+          <label>任务名（可选）
+            <input id="run-name" placeholder="例如 glm-5.2 基线" />
+          </label>
+          <label>Prompt
+            <textarea id="run-prompt" rows="4">以春为题写一首五言绝句，要求有意境。</textarea>
+          </label>
+          <div class="grid2">
+            <label>并发<input id="run-concurrency" type="number" value="10" min="1" /></label>
+            <label>请求数<input id="run-requests" type="number" value="20" min="1" /></label>
+            <label>max_tokens<input id="run-max-tokens" type="number" value="256" min="1" /></label>
+            <label>超时(秒)<input id="run-timeout" type="number" value="60" min="1" /></label>
+            <label>warmup<input id="run-warmup" type="number" value="2" min="0" /></label>
+            <label>retries<input id="run-retries" type="number" value="2" min="0" /></label>
+          </div>
+          <div class="checks">
+            <label><input id="run-stream" type="checkbox" checked /> 流式（测 TTFT）</label>
+            <label><input id="run-cache" type="checkbox" checked /> 统计缓存命中</label>
+            <label><input id="run-unique" type="checkbox" /> 破坏 prefix cache</label>
+          </div>
+          <button id="btn-start" class="primary">▶ 开始压测</button>
+          <button id="btn-probe" class="ghost block">🔍 先试跑一次（连通性 + 请求/响应结构）</button>
+        </div>
+
+        <div class="card">
+          <h2>运行状态</h2>
+          <div id="run-status" class="status">空闲</div>
+          <div class="progress"><div id="run-bar"></div></div>
+          <div id="run-metrics" class="metrics"></div>
+          <button id="btn-cancel" class="danger" disabled>■ 中止</button>
+          <pre id="run-log" class="log"></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 资产库 ───────────────────────────── -->
+    <section id="tab-assets" class="panel">
+      <div class="cols">
+        <div class="card">
+          <h2>连接</h2>
+          <label>名称<input id="conn-name" placeholder="例如 omnix 官方" /></label>
+          <label>Base URL<input id="conn-url" placeholder="https://api.example.com" /></label>
+          <label>接口路径（可选）
+            <input id="conn-endpoint" placeholder="留空=/v1/chat/completions；智谱填 /chat/completions" />
+          </label>
+          <label>密钥方式
+            <select id="conn-mode">
+              <option value="env">环境变量（推荐）</option>
+              <option value="local">本机加密存储</option>
+            </select>
+          </label>
+          <label id="wrap-env">环境变量名<input id="conn-env" placeholder="LLM_API_KEY" /></label>
+          <label id="wrap-key" hidden>API Key<input id="conn-key" type="password" placeholder="sk-..." /></label>
+          <button id="btn-save-conn" class="primary">保存连接</button>
+          <table id="conn-table"><tbody></tbody></table>
+        </div>
+
+        <div class="card">
+          <h2>模型</h2>
+          <label>显示名<input id="model-label" placeholder="例如 glm-5.2" /></label>
+          <label>模型 ID<input id="model-id" placeholder="例如 glm-5.2 / deepseek-v4-flash" /></label>
+          <label>所属连接<select id="model-conn"></select></label>
+          <label>extra_params（JSON，可选；⚠️ 会覆盖上面的表单参数；数值要写成数字，
+            如 <code>"max_tokens": 256</code>，写成 <code>"256"</code> 会被服务端忽略）
+            <textarea id="model-extra" rows="3" placeholder='{"thinking":{"type":"disabled"}}'></textarea>
+          </label>
+          <button id="btn-save-model" class="primary">保存模型</button>
+          <table id="model-table"><tbody></tbody></table>
+        </div>
+      </div>
+
+      <div class="cols" style="margin-top:16px">
+        <div class="card">
+          <h2>提示词库</h2>
+          <label>名称<input id="prompt-name" placeholder="例如 输入-3k" /></label>
+          <label>标签<input id="prompt-tags" placeholder="输入/业务/翻译" /></label>
+          <label>内容<textarea id="prompt-content" rows="4" placeholder="粘贴提示词内容"></textarea></label>
+          <button id="btn-save-prompt" class="primary">保存提示词</button>
+          <table id="prompt-table"><tbody></tbody></table>
+        </div>
+
+        <div class="card">
+          <h2>场景模板</h2>
+          <div class="bulk-box">
+            <label>场景名前缀<input id="sc-group" value="输入" /></label>
+            <label>从 prompts 目录批量导入（可多选，按 token 数排序）
+              <div id="prompt-files" class="checklist"></div>
+            </label>
+            <button id="btn-bulk-scenarios" class="ghost">批量生成场景</button>
+          </div>
+          <label>场景名<input id="sc-name" placeholder="例如 输入-3k（前缀决定分组）" /></label>
+          <label>提示词来源
+            <select id="sc-prompt-source"></select>
+          </label>
+          <div id="sc-prompt-info" class="muted" style="margin:-4px 0 10px"></div>
+          <label>覆盖参数（JSON，可选；⚠️ 优先级高于压测页的默认参数，同名字段以这里为准）
+            <textarea id="sc-overrides" rows="3" placeholder='{"max_tokens":512,"timeout":90}'></textarea>
+          </label>
+          <button id="btn-save-scenario" class="primary">保存场景</button>
+          <table id="scenario-table"><tbody></tbody></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 结果 ─────────────────────────────── -->
+    <section id="tab-results" class="panel">
+      <div class="card">
+        <h2>历史结果 <button id="btn-refresh-results" class="ghost">刷新</button></h2>
+        <table id="result-table"><tbody></tbody></table>
+        <div id="result-detail"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="probe-modal" class="modal" hidden>
+    <div class="modal-box">
+      <h2>连通性测试 · 请求 / 响应结构
+        <button id="probe-close" class="ghost">关闭</button>
+      </h2>
+      <div class="grid2">
+        <label>模型<select id="probe-model"></select></label>
+        <label>max_tokens<input id="probe-max-tokens" type="number" value="32" /></label>
+      </div>
+      <label>Prompt<textarea id="probe-prompt" rows="3">ping</textarea></label>
+      <label>extra_params（JSON，留空 = 用模型自带配置）
+        <textarea id="probe-extra" rows="2" placeholder='{"thinking":{"type":"disabled"}}'></textarea>
+      </label>
+      <div class="checks">
+        <label><input id="probe-stream" type="checkbox" /> 流式（查看 SSE 分片 / TTFT / usage 是否返回）</label>
+      </div>
+      <button id="probe-send" class="primary">发送测试请求</button>
+      <ul id="probe-hints" class="hints"></ul>
+
+      <div id="probe-summary" class="probe-summary"></div>
+
+      <div class="probe-cols">
+        <div>
+          <h3>请求体（与压测实际发送一致）</h3>
+          <div id="probe-request"></div>
+        </div>
+        <div>
+          <h3>接口返回</h3>
+          <div id="probe-response"></div>
+        </div>
+      </div>
+      <button id="probe-close-bottom" class="primary">关闭（不影响压测，可随时重新打开）</button>
+    </div>
+  </div>
+
+  <script src="/js/app.js"></script>
+</body>
+</html>

@@ -50,6 +50,7 @@ _DEFAULTS = {
     "http2": False,
     "warmup": 2,         # 默认预热 2 个请求，剔除冷启动对首批 TTFT 的污染
     "track_cache": True, # 采集 prompt 缓存命中（依赖 API 返回 cached_tokens 字段）
+    "endpoint": None,    # 接口路径；默认 /v1/chat/completions，智谱等填 /chat/completions
     "qps": None,
     "duration": None,
 }
@@ -60,7 +61,7 @@ _CONF_KEYS = [
     "concurrency", "requests", "timeout", "output_dir",
     "max_tokens", "temperature", "stream", "retries", "retry_backoff",
     "read_timeout", "unique_prefix", "verbose", "extra_params",
-    "http2", "warmup", "track_cache", "qps", "duration",
+    "http2", "warmup", "track_cache", "endpoint", "qps", "duration",
 ]
 
 # 引擎注册表
@@ -157,6 +158,7 @@ def build_engine_config(raw: dict) -> dict:
         "http2": raw.get("http2", _DEFAULTS["http2"]),
         "warmup": raw.get("warmup", _DEFAULTS["warmup"]),
         "track_cache": raw.get("track_cache", _DEFAULTS["track_cache"]),
+        "endpoint": raw.get("endpoint", _DEFAULTS["endpoint"]),
         "qps": raw.get("qps", _DEFAULTS["qps"]),
         "duration": raw.get("duration", _DEFAULTS["duration"]),
     }
@@ -454,6 +456,9 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--track-cache", action=argparse.BooleanOptionalAction, default=_DEFAULTS["track_cache"],
                    help="是否采集 Prompt 缓存命中率（依赖 API 返回 prompt_tokens_details.cached_tokens；"
                         "API 不支持时自动降级并提示）；--no-track-cache 显式关闭")
+    p.add_argument("--endpoint", default=_DEFAULTS["endpoint"],
+                   help="Chat Completions 路径，默认 /v1/chat/completions；"
+                        "智谱官方填 /chat/completions（base-url 用 https://open.bigmodel.cn/api/paas/v4）")
     p.add_argument("-v", "--verbose", action="store_true", default=_DEFAULTS["verbose"],
                    help="打印首个请求的原始 chunk 格式，用于诊断解析问题")
 

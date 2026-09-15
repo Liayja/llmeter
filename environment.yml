@@ -1,0 +1,14 @@
+# conda 环境：conda env create -f environment.yml
+#
+# 若本机 conda 镜像（如 USTC）不可达，改用官方源：
+#   conda env create -f environment.yml --override-channels \
+#     -c https://repo.anaconda.com/pkgs/main -c https://repo.anaconda.com/pkgs/r
+name: llmeter
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - -r requirements.txt
+      - -r requirements-web.txt

@@ -6,6 +6,187 @@
 
 ---
 
+## 2026-09-10 — 本地 Web 压测平台 M1（跑通最小闭环）
+
+在 CLI 之外新增本地 Web 界面，目标是把「配置 → 压测 → 看结果」从命令行搬到浏览器，引擎与指标口径保持不变。
+
+### 新增：平台骨架（`app/`）
+
+- **FastAPI + uvicorn** 本地服务（仅监听 `127.0.0.1`，默认端口 8765），`python -m app.main` 启动；
+- **静态单页前端**（`app/static/`，原生 JS + SSE，无 Node 构建）：压测 / 资产库 / 结果三个页签；
+- **SQLite 资产库**（`app/data/llmeter.db`，已 git 忽略）：connections / models / tasks。
+
+### 新增：密钥两种存法
+
+- `env`：库里只存环境变量名，运行时用 `${VAR}` 展开；
+- `local`：Windows DPAPI 加密后落库（非 Windows 降级 base64 并提示）；接口一律返回脱敏值（如 `sk-****1234`）。
+
+### 引擎适配（口径不变）
+
+- `LLMBench` 新增可选 `on_progress` 回调与 `request_cancel()`：进度每秒/每请求上报，取消后不再发起新请求；
+- CLI 不传回调时输出行为与之前完全一致；
+- 结果落盘仍复用 `output.save_results` / `save_excel`，产物结构不变。
+
+### 验证
+
+- mock SSE 服务端到端：建连接（DPAPI 加密）→ 建模型 → 跑 6 请求 → SSE 进度 → 成功率 100%、缓存命中 50% → JSON/Excel 下载；
+- 取消验证：10 请求任务在 1.2s 中止，实际只发出 6 个请求，状态 `canceled` 且已跑结果正常保存；
+- 真实 HTTP 服务验证：`/api/health` 200、首页与 JS/CSS 正常返回。
+
+### 修复：接口路径可配置（智谱等非 /v1 路径）
+
+- 此前引擎把地址硬编码为 `{base_url}/v1/chat/completions`，智谱官方（`https://open.bigmodel.cn/api/paas/v4/chat/completions`）会 404。
+  - `src/engine.py` 新增 `build_chat_url()` 与 `endpoint` 参数：默认仍是 `/v1/chat/completions`，可按厂商覆盖（智谱填 `/chat/completions`）；
+  - 兼容 `base_url` 已带 `/v1`、或用户直接粘贴完整 `.../chat/completions` 地址的写法，避免拼出重复路径；
+  - `bench.py` 新增 `--endpoint`（配置文件同名字段）；平台「连接」新增「接口路径」输入框，连通性测试与压测共用同一拼接规则。
+- 验证：mock 服务只接受 `/api/paas/v4/chat/completions`，连接测试与 4 个压测请求全部命中该路径。
+
+### 修复：scenarios 模式漏传接口路径（智谱仍打到 /v1）
+
+- 实测发现「多模型 × 多场景」任务仍会打到 `/v1/chat/completions`：`run_scenarios` 组装引擎参数时**漏传了 `endpoint`**，于是回落到默认路径（单模型 chat 模式正常）。
+  - `app/services/runner_bridge.py`：scenarios 模式补齐 `endpoint` 透传；
+  - 保存的 JSON `meta` 新增 `endpoint` 与 `chat_url` 字段，后续排查可直接看到实际请求地址；
+  - `build_chat_url` 的重复段判断从「仅 /v1」推广到任意首段，兼容 `base_url=.../v4` + `endpoint=/v4/chat/completions` 这类写法。
+- 验证：`base_url=.../api/paas` + `endpoint=/v4/chat/completions` 下，scenarios 与 chat 两种模式的所有请求均命中 `/api/paas/v4/chat/completions`。
+
+## 2026-09-10 — 本地 Web 压测平台 M2（多模型 × 多场景）
+
+### 新增：多模型 × 多场景对比
+
+- **[`app/services/runner_bridge.py`](../app/services/runner_bridge.py) `run_scenarios`**：遍历「模型 × 场景」笛卡尔积逐个执行，复用 `LLMBench` 与 `output` 的对比报告函数，指标口径与 CLI 完全一致；
+  - 每个场景单独落 JSON（文件名追加场景名，避免同秒覆盖），最后生成 Markdown / CSV / Excel 对比报告与 comparison JSON；
+  - 支持中途取消：当前场景停下、已完成结果照常出报告。
+- **[`app/routers/tasks.py`](../app/routers/tasks.py)**：任务支持 `mode=scenarios`（`model_ids[]` + `scenario_ids[]`），快照中只保存连接 ID，明文密钥在启动时才解析。
+
+### 新增：提示词库与场景模板
+
+- 数据表 `prompts` / `scenarios`，对应 API `/api/prompts`、`/api/scenarios`；
+- 场景模板支持覆盖参数（`max_tokens`、`timeout`、`qps`、`duration` 等 JSON），界面可从提示词库选择提示词；
+- 前端「压测」页新增模式切换（单模型 / 多模型 × 多场景），「资产库」页新增提示词库与场景模板两个面板；结果页对 scenarios 任务展示对比表。
+
+### 验证
+
+- mock 服务下 2 模型 × 3 场景 = 6 组全部成功，对比行 6 条、组合无重复，comparison JSON / Excel 下载正常；
+- 静态页与新增接口（`/api/prompts`、`/api/scenarios`）在真实 HTTP 服务下均返回 200。
+
+### 优化：单模型 × 多场景作为主用法
+
+- 实测最常用的压测形态是「**单模型跑多场景**」（如输入长度梯度找拐点），而不是多模型横向对比。
+  - 界面默认模式改为「场景对比（1~N 模型 × 多场景）」：选 1 个模型即单模型多场景，选多个模型即横向对比，不再需要区分两种模式；
+  - 「单次压测（1 模型 · 1 提示词）」保留为次选模式。
+- 新增「一键批量建场景」：`GET /api/prompts/files` 列出项目 `prompts/` 目录并按 token 数排序，`POST /api/scenarios/bulk` 批量生成场景；
+  命名会去掉冗余前缀（`prompts/input-3k.txt` + 前缀「输入」→ `输入-3k`）。
+- 验证：从 prompts 目录批量建 3 个场景 → 单模型 × 3 场景跑通，对比行 3 条、缓存列有值。
+
+### 修复：缓存命中列的"空值"观感
+
+- API 未返回 `prompt_tokens_details.cached_tokens` 时，Excel 缓存列原本是**空白单元格**，看起来像漏了指标；
+  现改为显示 `—`（明确表示未上报），有数据时仍写数值（如 40 表示 40%）。
+
+### 优化：运行中进度改为按模式展示有效指标
+
+- 反馈「并发 5 时活跃/峰值一直显示 5，看不出区别」：闭环并发下这两个数稳态就等于并发上限，确实没有信息量。
+  - 进度事件新增 `mode` / `rate`（实时完成速率）/ `elapsed` / `eta` / `avg_latency` / `concurrency_target` / `qps_target`；
+  - **闭环**：显示「并发 x/目标（已打满 / 峰值未打满）」+ 实时速率 + 平均延迟 + TTFT + ETA + 失败数；只有**没打满**时才提示峰值，避免刷屏；
+  - **开环**：保留「在途/峰值积压」——这正是判断服务器扛不扛得住的关键信号；
+  - CLI 的每秒进度行同步改版（与平台共用同一 `_emit_progress`）。
+- 示例（闭环并发 3）：`⏳ 6/12 | 并发已满 3 | 5.50 req/s | TTFT 0.34s | ETA 1s | 失败 0`
+
+### 新增：压测前连通性测试与请求/响应结构回显
+
+- 需求：正式压测前先打一发，看清**请求体与响应体结构**（模型名、extra_params、usage 字段是否齐全），避免直接压测才发现配置或响应格式不对。
+- **[`src/engine.py`](../src/engine.py)**：抽出 `build_chat_payload()`，压测与调试共用同一个请求体构造函数，保证"调试看到的 = 压测发出的"。
+- **[`app/services/probe.py`](../app/services/probe.py)**：单次探测服务，返回
+  - 请求：URL、脱敏请求头、完整 payload、prompt token 估算；
+  - 响应：状态码、耗时、TTFT（流式）、关键响应头（含 `x-ratelimit-*` / `retry-after`）、usage、正文或 SSE 分片；
+  - 提示：`✅ HTTP 200`、usage 是否齐全、是否支持 `cached_tokens` / `reasoning_tokens`、流式解析方式（`choices[0].delta.content`）、非标准结构告警。
+- **API**：`POST /api/models/{id}/probe`（可覆盖 prompt / max_tokens / stream / extra_params）；连接级 `POST /api/connections/{id}/test` 改为复用同一探测服务并返回提示。
+- **界面**：压测页新增「🔍 先试跑一次（连通性 + 请求/响应结构）」（带当前表单参数），资产库模型卡片新增「调试」入口；弹窗内并排显示请求体与响应体，附结构提示。
+- 验证：mock 服务下非流式与流式各验证一次——请求体正确带回 `extra_params`、响应 usage/cached_tokens/reasoning_tokens 正常解析、TTFT 与分片统计正确、密钥在回显中脱敏。
+
+### 修复：调试弹窗关不掉（CSS 优先级）
+
+- 现象：连通性测试弹窗点右上角「关闭」没反应。
+- 原因：`.modal { display: flex }` 属于作者样式，会覆盖浏览器默认的 `[hidden] { display: none }`，
+  于是 `element.hidden = true` 设了属性但元素照样显示。同一个坑还影响「密钥方式」切换时环境变量/密钥输入框的显隐。
+  - 在 `app/static/css/app.css` 增加 `[hidden] { display: none !important; }` 兜底，一次性修好所有 `hidden` 显隐；
+  - 弹窗补充三种关闭方式：右上角按钮、底部「关闭」按钮、点击遮罩空白处、按 Esc。
+- 说明：调试是**完全独立**的一次请求（`POST /api/models/{id}/probe`），既不创建也不启动压测任务，看完随时关闭即可，不存在"必须先压测"的流程。
+- 验证：真实浏览器（in-app browser）实测——打开弹窗后，点关闭按钮 / 按 Esc / 点遮罩空白处均能关闭；密钥方式切换后两个输入框显隐正确；探测接口调用后任务列表为空。
+
+### 优化：调试弹窗区分「接口原生」与「客户端计算」
+
+- 反馈「响应体是有封装还是原生返回？为什么里面还有 TTFT」——TTFT 不是接口字段，是客户端测量值，混在一起容易误读。
+  - 响应区拆成两块：**① HTTP 原文（接口原样返回，未加工）**：`status_code` / 关键响应头 / `raw`（非流式为响应正文原文，流式为原始 SSE 行，含 `[DONE]`）；
+    **② 客户端解析 / 计算（非接口字段）**：`usage`（来自接口）、`elapsed`、`ttft`、`chunk_count`、`text`、`reasoning_text`；
+  - `probe` 服务新增 `raw` / `raw_truncated` 字段；提示文案注明「TTFT 为客户端测量：发请求 → 首个内容分片」。
+- 验证：mock 服务下非流式 `raw` 为响应正文原文，流式 `raw` 为 5 行原始 SSE（含 `[DONE]`）；真实浏览器中两个分栏均能正确填充。
+
+### 优化：调试结果改为结构化展示（不再堆 JSON 文本）
+
+- 反馈「即使是原生响应，也要让人看得懂，不能一片密密麻麻的文字」。
+  - 顶部指标卡：HTTP 状态（绿/红）、总耗时、TTFT（标注"客户端测量"）、SSE 分片数、输入/输出 token、缓存命中 token；
+  - 响应头与 usage 改为**两列键值表**，不再让用户在一串 JSON 里找字段；
+  - 推理内容与回答内容**分块用正常字号展示**（可读、可复制），不再是等宽密文；
+  - SSE 分片**逐条列出**（`#1 内容 "…"` / `#2 usage …` / 末条 `[DONE]`），每条可展开查看原始 JSON；
+  - 完整 HTTP 原文与解析后 JSON 收进**默认折叠**的 `<details>`，需要排查时再展开，兼顾"看得懂"与"可追溯"。
+- 验证：真实浏览器下流式请求渲染出 6 个指标卡、10 行键值表、推理/回答两个内容块、6 条分片条目，原文折叠默认收起。
+
+### 修复：ETA 被大幅高估（如 4/100 显示 1354s）
+
+- 现象：`4/100 | 并发 5/5 | 0.07 req/s | TTFT 3.42s | ETA 1354s`，ETA 明显不合理。
+- 原因不是单位，而是算法：ETA = 剩余数 ÷ **从运行开始到现在**的累计平均速率，而这个速率被两件事压低了——
+  1. **预热时间算进了分母**：`_started_at` 在预热之前打点，但预热请求不计入完成数（默认 2 个）；
+  2. **累计平均在开跑初期必然偏低**：启动、建连、首批慢请求都摊在很小的样本上。
+  - 计时改为**预热之后**开始（预热不再污染 elapsed/速率）；
+  - 速率改为**最近 20s 滑动窗口**（窗口未填充时退回累计平均），并在进度里同时给出 `rate`（近 20s）与 `rate_overall`（累计）；
+  - 完成数 < 3 时不给 ETA，界面/终端显示「计算中」，避免出现上千秒的误导值。
+- 验证：mock 每请求 1s、并发 2、预热 2、共 8 个请求——结束时 `elapsed=4.04s`（墙钟 5.17s，已排除 1s 预热），
+  中间样本 `rate≈1.48 req/s`、`ETA≈3.4s`（与剩余量/速率一致），前两个样本显示「计算中」。
+
+### 修复：max_tokens 配置"没生效"（extra_params 静默覆盖）
+
+- 现象：表单/场景里配 `max_tokens: 256`，模型后台调用日志里实际输出 1024。
+- 复现结论：请求体构造里 `extra_params` 是**最后合并**的（设计上允许模型/场景级覆盖顶层字段），
+  若模型的 `extra_params` 里写了 `max_tokens`，就会静默盖掉表单值——实测发出的 body 为 `"max_tokens": 1024`。
+  - 探测（调试）结果：新增冲突提示，例如
+    `⚠️ extra_params 覆盖了这些参数：max_tokens：256 → 1024`（放在提示首条，最显眼）；
+  - 压测开跑时（CLI 与平台日志）同样打印覆盖告警，避免"配置没生效"的误解；
+  - 界面表单标注：模型 `extra_params` 与场景「覆盖参数」会覆盖压测页的同名表单参数；
+  - 结果 JSON 的 `meta` 新增 `max_tokens` / `temperature` / `extra_params`（此前不落盘，事后无法核对）。
+- 验证：① 冲突场景告警正确且实际发送 1024；② `extra_params` 不含 `max_tokens` 时表单值 256 正常生效；
+  ③ 引擎（CLI/平台共用）开跑日志打印 `max_tokens: 256 → 1024` 告警。
+
+### 修复：`"max_tokens": "256"` 这类字符串值导致参数被服务端忽略
+
+- 反馈：场景 `extra_params` 里写的是 `{"max_tokens": "256"}`，模型后台看到的输出却是 1024。
+- 原因：**值是字符串不是数字**。OpenAI 兼容接口要求 `max_tokens` 为整数，很多网关遇到非法类型时
+  不报错而是**静默忽略**，回落到服务端默认长度（表现为"配置没生效"）。旧代码原样透传，没有类型校验。
+  - `src/engine.py` 新增 `normalize_extra_params()`：把数值字段的数字字符串自动转成数字
+    （`"256"` → `256`、`"0.7"` → `0.7`），覆盖 `max_tokens` / `max_completion_tokens` / `n` / `seed` /
+    `temperature` / `top_p` / `presence_penalty` / `frequency_penalty` / `top_k` 等；
+    非数字字符串（如 `"abc"`）保持原值并给出告警（交给服务端报错更安全）。
+  - 规范化发生在构造请求体之前，**CLI 与平台共用**；探测提示与压测开跑日志都会说明发生了什么；
+  - 界面 `extra_params` 输入框标注"数值要写成数字，如 `"max_tokens": 256`，写成 `"256"` 会被服务端忽略"。
+- 验证：`{"max_tokens": "256"}` → 实际发送 `256`（int）并输出规范化提示；`{"max_tokens": "abc"}` → 保留原值 + 告警。
+
+### 修复：场景名与提示词内容规模错位（如"输入-20k"实际发的是 10k 内容）
+
+- 现象：`输入-20k` 场景实际请求的输入 token 与 `输入-10k` 完全一致（都是 4750）。
+- 排查结论：场景库里该场景的提示词**内容**就是 10k 那份（9,797 字符 ≈ 7,094 token，和 `输入-10k` 一模一样），
+  而 `prompts/input-20k.txt` 实际是 23,828 字符 ≈ 21,277 token。
+  场景是在表单里"选提示词库 → 复制内容进场景"创建的，选错了提示词后**名字与内容脱钩**，界面上无从发现。
+  - `GET /api/scenarios` 新增 `prompt_source` / `prompt_chars` / `prompt_tokens_est`；
+    `GET /api/prompts` 新增 `chars` / `tokens_est`；
+  - 场景列表新增「提示词来源」「规模(≈token)」两列——名字写 20k、实际 7,094 token 一眼可见；
+  - 场景表单选中提示词后实时提示「已选提示词：X · N 字符 ≈ M token」；
+  - 保存时若场景名里的数字（如 `20k`）与所选提示词规模相差超过 40%，弹确认框拦截（可强行继续）。
+- 验证：浏览器实测——列表显示 `输入-20k | 内置文本（复制内容） | 7,094 (9,797 字符)`；
+  以「输入-20k-测试 + 输入-10k 提示词」保存时弹出确认框，取消后未创建场景。
+- 建议用法：批量建场景走「从 prompts 目录导入」（存 `prompt_file` 引用，内容随文件走，不会错位）。
+
+---
+
 ## 2026-09-09 — Excel 报表瘦身与结论准确性修正
 
 ### 修正：移除冗余的「仪表盘」封面
