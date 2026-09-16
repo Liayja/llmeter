@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>llmeter 压测平台</title>
-  <link rel="stylesheet" href="/css/app.css" />
+  <link rel="stylesheet" href="/css/app.css?v=20260915f" />
 </head>
 <body>
   <header>
@@ -12,6 +12,7 @@
     <nav>
       <button class="tab active" data-tab="run">压测</button>
       <button class="tab" data-tab="assets">资产库</button>
+      <button class="tab" data-tab="parity">一致性基准</button>
       <button class="tab" data-tab="results">结果</button>
     </nav>
     <span id="health" class="health">连接中…</span>
@@ -78,9 +79,9 @@
         <div class="card">
           <h2>连接</h2>
           <label>名称<input id="conn-name" placeholder="例如 omnix 官方" /></label>
-          <label>Base URL<input id="conn-url" placeholder="https://api.example.com" /></label>
+          <label>Base URL（必填）<input id="conn-url" placeholder="https://api.deepseek.com 或 https://open.bigmodel.cn/api/paas" /></label>
           <label>接口路径（可选）
-            <input id="conn-endpoint" placeholder="留空=/v1/chat/completions；智谱填 /chat/completions" />
+            <input id="conn-endpoint" placeholder="只填路径：留空=/v1/chat/completions；智谱=/chat/completions；DeepSeek=/chat/completions" />
           </label>
           <label>密钥方式
             <select id="conn-mode">
@@ -89,8 +90,10 @@
             </select>
           </label>
           <label id="wrap-env">环境变量名<input id="conn-env" placeholder="LLM_API_KEY" /></label>
-          <label id="wrap-key" hidden>API Key<input id="conn-key" type="password" placeholder="sk-..." /></label>
+          <label id="wrap-key" hidden>API Key<input id="conn-key" type="password" placeholder="sk-..." />
+            <span class="muted">编辑时留空表示保持原密钥不变</span></label>
           <button id="btn-save-conn" class="primary">保存连接</button>
+          <button id="btn-cancel-conn" class="ghost block" hidden>取消编辑</button>
           <table id="conn-table"><tbody></tbody></table>
         </div>
 
@@ -104,6 +107,7 @@
             <textarea id="model-extra" rows="3" placeholder='{"thinking":{"type":"disabled"}}'></textarea>
           </label>
           <button id="btn-save-model" class="primary">保存模型</button>
+          <button id="btn-cancel-model" class="ghost block" hidden>取消编辑</button>
           <table id="model-table"><tbody></tbody></table>
         </div>
       </div>
@@ -149,6 +153,52 @@
         <div id="result-detail"></div>
       </div>
     </section>
+
+    <!-- ── 一致性基准（独立模块，与压测分开）────────────── -->
+    <section id="tab-parity" class="panel">
+      <div class="cols">
+        <div class="card">
+          <h2>① 建立基线（官方模型只跑一次）</h2>
+          <label>官方模型
+            <span class="inline-row">
+              <select id="pb-model"></select>
+              <button type="button" class="ghost" id="btn-refresh-pb-models">刷新</button>
+            </span>
+          </label>
+          <div id="pb-model-hint" class="muted" style="margin:-6px 0 10px"></div>
+          <label>基线名称（可选）<input id="pb-name" placeholder="例如 glm-5.3-official@2026-09-15" /></label>
+          <div class="sect-title">选择测试维度（可多选）</div>
+          <div id="pb-dimensions" class="checklist"></div>
+          <button id="btn-create-baseline" class="primary">建立基线</button>
+          <div id="pb-progress" class="progress-box" hidden></div>
+          <div class="sect-title">已有基线</div>
+          <table id="pb-table"><tbody></tbody></table>
+        </div>
+
+        <div class="card">
+          <h2>② 候选测试（只跑候选，与基线比对）</h2>
+          <label>选择基线<select id="pr-baseline"></select></label>
+          <label>候选模型
+            <span class="inline-row">
+              <select id="pr-model"></select>
+              <button type="button" class="ghost" id="btn-refresh-pr-models">刷新</button>
+            </span>
+          </label>
+          <div id="pr-model-hint" class="muted" style="margin:-6px 0 10px"></div>
+          <label>任务名（可选）<input id="pr-name" placeholder="例如 GodawnAi-GLM-5.3 对比" /></label>
+          <button id="btn-create-run" class="primary">开始候选测试</button>
+          <div id="pr-progress" class="progress-box" hidden></div>
+          <div class="sect-title">运行记录</div>
+          <table id="pr-table"><tbody></tbody></table>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <h2>③ 对比报告</h2>
+        <div id="pb-detail" class="muted">在「已有基线」里点「查看」，可查看该基线每条用例的实际请求结果。</div>
+        <div id="pr-report" class="muted">选择左侧运行记录中的「查看」以显示报告。</div>
+      </div>
+    </section>
   </main>
 
   <div id="probe-modal" class="modal" hidden>
@@ -186,6 +236,7 @@
     </div>
   </div>
 
-  <script src="/js/app.js"></script>
+  <!-- 加版本号，强制浏览器在更新后重新拉取脚本（改前端时请同步 +1） -->
+  <script src="/js/app.js?v=20260915g"></script>
 </body>
 </html>

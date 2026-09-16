@@ -30,6 +30,17 @@ input, select, textarea { width:100%; margin-top:4px; padding:7px 9px; border:1p
 .checklist input { width:auto; margin:0; }
 .bulk-box { border:1px dashed var(--line); border-radius:6px; padding:10px; margin-bottom:12px; background:#fafcff; }
 .bulk-box button { width:100%; margin-top:4px; }
+.inline-row { display:flex; gap:6px; align-items:center; }
+.inline-row select { flex:1; }
+.inline-row button { white-space:nowrap; }
+.progress-box { background:#eef3fb; border:1px solid var(--line); border-radius:6px; padding:8px 10px;
+  font-size:12px; margin-top:10px; line-height:1.7; }
+.progress-box .bar { height:8px; background:#dbe4f0; border-radius:4px; overflow:hidden; margin:6px 0; }
+.progress-box .bar > i { display:block; height:100%; background:var(--primary); transition:width .3s; }
+.case-detail { border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin-bottom:8px; background:#fff; }
+.case-detail > summary { cursor:pointer; font-size:13px; color:#334; }
+.case-detail[open] > summary { font-weight:600; color:var(--primary); margin-bottom:6px; }
+.case-detail .probe-cols { margin-top:6px; }
 button { font:inherit; cursor:pointer; }
 button.primary { width:100%; padding:10px; background:var(--primary); color:#fff; border:none; border-radius:6px; font-size:14px; }
 button.primary:disabled { background:#9fb0cc; cursor:not-allowed; }

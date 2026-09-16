@@ -17,6 +17,9 @@ let currentTaskId = null;
 let eventSource = null;
 let modelsCache = [];
 let promptsCache = [];
+let connCache = [];
+let editingConnectionId = null;
+let editingModelId = null;
 
 /* ── 页签 ───────────────────────────────── */
 document.querySelectorAll(".tab").forEach((btn) => {
@@ -25,6 +28,11 @@ document.querySelectorAll(".tab").forEach((btn) => {
     document.querySelectorAll(".panel").forEach((p) =>
       p.classList.toggle("active", p.id === `tab-${btn.dataset.tab}`));
     if (btn.dataset.tab === "results") loadResults();
+    if (btn.dataset.tab === "parity") {
+      // 打开页签时重新拉一次模型/维度/基线，避免列表为空或数据过期
+      loadModels().then(() => { loadParityBaselines(); loadParityRuns(); });
+      if (!parityDims.length) loadParityDimensions();
+    }
   };
 });
 
@@ -42,6 +50,7 @@ $("#conn-mode").onchange = () => {
 
 async function loadConnections() {
   const rows = await api("/api/connections");
+  connCache = rows;
   const tbody = $("#conn-table tbody");
   tbody.innerHTML = `<tr><th>名称</th><th>Base URL</th><th>密钥</th><th></th></tr>` +
     rows.map((r) => `<tr>
@@ -49,6 +58,7 @@ async function loadConnections() {
       <td>${r.base_url}</td>
       <td><span class="tag ${r.key_mode}">${r.key_mode === "env" ? "环境变量" : "本机加密"}</span> ${r.key_ref || ""}</td>
       <td>
+        <button onclick="editConnection(${r.id})">编辑</button>
         <button onclick="testConnection(${r.id})">测试</button>
         <button onclick="deleteConnection(${r.id})">删除</button>
       </td>
@@ -58,24 +68,69 @@ async function loadConnections() {
 }
 
 $("#btn-save-conn").onclick = async () => {
+  const payload = {
+    name: $("#conn-name").value.trim(),
+    base_url: $("#conn-url").value.trim(),
+    endpoint: $("#conn-endpoint").value.trim(),
+    key_mode: $("#conn-mode").value,
+    env_var: $("#conn-env").value.trim(),
+    api_key: $("#conn-key").value.trim(),
+  };
+  // 容错：Base URL 空但接口路径填了完整地址 → 自动纠正为 Base URL
+  if (!payload.base_url && /^https?:\/\//i.test(payload.endpoint)) {
+    payload.base_url = payload.endpoint;
+    payload.endpoint = "";
+    $("#conn-url").value = payload.base_url;
+    $("#conn-endpoint").value = "";
+  }
+  if (!payload.base_url) return alert("请填写 Base URL（完整地址，例如 https://api.deepseek.com）");
   try {
-    await api("/api/connections", {
-      method: "POST",
-      body: JSON.stringify({
-        name: $("#conn-name").value.trim(),
-        base_url: $("#conn-url").value.trim(),
-        endpoint: $("#conn-endpoint").value.trim(),
-        key_mode: $("#conn-mode").value,
-        env_var: $("#conn-env").value.trim(),
-        api_key: $("#conn-key").value.trim(),
-      }),
-    });
-    $("#conn-name").value = $("#conn-url").value = $("#conn-key").value = $("#conn-endpoint").value = "";
+    if (editingConnectionId) {
+      await api(`/api/connections/${editingConnectionId}`, { method: "PUT", body: JSON.stringify(payload) });
+    } else {
+      await api("/api/connections", { method: "POST", body: JSON.stringify(payload) });
+    }
+    const wasEditing = !!editingConnectionId;
+    resetConnectionForm();
     await loadConnections();
     await loadModels();
-    alert("连接已保存");
+    alert(wasEditing ? "连接已更新" : "连接已保存");
   } catch (e) { alert(`保存失败: ${e.message}`); }
 };
+
+function resetConnectionForm() {
+  editingConnectionId = null;
+  $("#conn-name").value = $("#conn-url").value = $("#conn-endpoint").value = "";
+  $("#conn-env").value = $("#conn-key").value = "";
+  $("#conn-key").placeholder = "sk-...";
+  $("#btn-save-conn").textContent = "保存连接";
+  $("#btn-cancel-conn").hidden = true;
+}
+
+window.editConnection = (id) => {
+  const c = connCache.find((x) => x.id === id);
+  if (!c) return;
+  editingConnectionId = id;
+  $("#conn-name").value = c.name || "";
+  $("#conn-url").value = c.base_url || "";
+  $("#conn-endpoint").value = c.endpoint || "";
+  $("#conn-mode").value = c.key_mode || "env";
+  if ((c.key_mode || "env") === "env") {
+    $("#conn-env").value = c.key_ref || "";
+    $("#conn-key").value = "";
+    $("#conn-key").placeholder = "当前为环境变量模式，无需填写";
+  } else {
+    $("#conn-env").value = "";
+    $("#conn-key").value = "";
+    $("#conn-key").placeholder = `留空 = 保持原密钥（${c.key_ref || "****"}）`;
+  }
+  if (typeof $("#conn-mode").onchange === "function") $("#conn-mode").onchange();
+  $("#btn-save-conn").textContent = "保存修改";
+  $("#btn-cancel-conn").hidden = false;
+  window.scrollTo({ top: 0, behavior: "smooth" });
+};
+
+$("#btn-cancel-conn").onclick = resetConnectionForm;
 
 window.deleteConnection = async (id) => {
   if (!confirm("删除该连接？绑定它的模型会失去连接。")) return;
@@ -97,12 +152,25 @@ async function loadModels() {
     tbody.innerHTML = `<tr><th>显示名</th><th>模型</th><th>连接</th><th></th></tr>` +
     rows.map((r) => `<tr>
       <td>${r.label}</td><td>${r.model}</td><td>${r.connection_id ?? "-"}</td>
-      <td><button onclick="window.openProbe(${r.id})">调试</button>
+      <td><button onclick="editModel(${r.id})">编辑</button>
+          <button onclick="window.openProbe(${r.id})">调试</button>
           <button onclick="deleteModel(${r.id})">删除</button></td>
     </tr>`).join("");
   $("#probe-model").innerHTML = rows.map((r) => `<option value="${r.id}">${r.label} (${r.model})</option>`).join("");
   const sel = $("#run-model");
   sel.innerHTML = rows.map((r) => `<option value="${r.id}">${r.label} (${r.model})</option>`).join("");
+  const pSel = $("#pb-model");
+  const rSel = $("#pr-model");
+  const options = rows.length
+    ? rows.map((r) => `<option value="${r.id}">${r.label} (${r.model})</option>`).join("")
+    : `<option value="">⚠️ 暂无模型，请先到「资产库」添加</option>`;
+  if (pSel) pSel.innerHTML = options;
+  if (rSel) rSel.innerHTML = options;
+  const hint = rows.length
+    ? `共 ${rows.length} 个模型，可下拉选择；没有想要的模型请到「资产库」新增`
+    : "还没有配置模型：请到「资产库」→ 模型 里先添加（需要先有连接）";
+  if ($("#pb-model-hint")) $("#pb-model-hint").textContent = hint;
+  if ($("#pr-model-hint")) $("#pr-model-hint").textContent = hint;
   $("#run-models").innerHTML = rows.length
     ? rows.map((r) => `<label><input type="checkbox" class="run-model-ck" value="${r.id}" /> ${r.label} (${r.model})</label>`).join("")
     : "<span class='muted'>请先在左侧添加模型</span>";
@@ -245,21 +313,48 @@ $("#btn-save-model").onclick = async () => {
   if (raw) {
     try { extra = JSON.parse(raw); } catch (e) { return alert("extra_params 不是合法 JSON"); }
   }
+  const payload = {
+    label: $("#model-label").value.trim(),
+    model: $("#model-id").value.trim(),
+    connection_id: Number($("#model-conn").value) || null,
+    extra_params: extra,
+  };
   try {
-    await api("/api/models", {
-      method: "POST",
-      body: JSON.stringify({
-        label: $("#model-label").value.trim(),
-        model: $("#model-id").value.trim(),
-        connection_id: Number($("#model-conn").value) || null,
-        extra_params: extra,
-      }),
-    });
-    $("#model-label").value = $("#model-id").value = $("#model-extra").value = "";
+    if (editingModelId) {
+      await api(`/api/models/${editingModelId}`, { method: "PUT", body: JSON.stringify(payload) });
+    } else {
+      await api("/api/models", { method: "POST", body: JSON.stringify(payload) });
+    }
+    const wasEditing = !!editingModelId;
+    resetModelForm();
     await loadModels();
-    alert("模型已保存");
+    alert(wasEditing ? "模型已更新" : "模型已保存");
   } catch (e) { alert(`保存失败: ${e.message}`); }
 };
+
+function resetModelForm() {
+  editingModelId = null;
+  $("#model-label").value = $("#model-id").value = $("#model-extra").value = "";
+  $("#btn-save-model").textContent = "保存模型";
+  $("#btn-cancel-model").hidden = true;
+}
+
+window.editModel = (id) => {
+  const m = modelsCache.find((x) => x.id === id);
+  if (!m) return;
+  editingModelId = id;
+  $("#model-label").value = m.label || "";
+  $("#model-id").value = m.model || "";
+  $("#model-conn").value = m.connection_id ?? "";
+  let extra = m.extra_params || "{}";
+  try { extra = JSON.stringify(JSON.parse(extra || "{}"), null, 2); } catch (e) { /* keep */ }
+  $("#model-extra").value = extra === "{}" ? "" : extra;
+  $("#btn-save-model").textContent = "保存修改";
+  $("#btn-cancel-model").hidden = false;
+  window.scrollTo({ top: 0, behavior: "smooth" });
+};
+
+$("#btn-cancel-model").onclick = resetModelForm;
 
 window.deleteModel = async (id) => {
   if (!confirm("删除该模型？")) return;
@@ -604,10 +699,271 @@ window.showResult = async (id) => {
 };
 
 /* ── 初始化 ───────────────────────────── */
+
+/* ── 一致性基准（独立模块）────────────────*/
+let parityDims = [];
+
+async function loadParityDimensions() {
+  parityDims = await api("/api/parity/dimensions");
+  $("#pb-dimensions").innerHTML = parityDims.map((d) => `
+    <label title="权重 ${d.weight}%">
+      <input type="checkbox" class="pb-dim" value="${d.id}" checked />
+      ${d.id} ${d.name} <span class="muted">${d.cases} 条 · 权重 ${d.weight}%</span>
+    </label>`).join("");
+}
+
+async function loadParityBaselines() {
+  const rows = await api("/api/parity/baselines");
+  $("#pb-table tbody").innerHTML = `<tr><th>基线</th><th>模型</th><th>状态</th><th>条目</th><th></th></tr>` +
+    rows.map((b) => `<tr>
+      <td>${b.name}</td><td>${b.model_label}</td>
+      <td>${b.status === "ready" ? "✅ 就绪" : b.status === "running" ? "⏳ 建立中" : b.status}</td>
+      <td>${b.items}</td>
+      <td>
+        <button onclick="showBaselineDetail(${b.id})">查看</button>
+        <button onclick="deleteParityBaseline(${b.id})">删除</button>
+      </td>
+    </tr>`).join("");
+  $("#pr-baseline").innerHTML = rows.filter((b) => b.status === "ready")
+    .map((b) => `<option value="${b.id}">${b.name}（${b.items} 条）</option>`).join("");
+}
+
+$("#btn-create-baseline").onclick = async () => {
+  const modelId = Number($("#pb-model").value);
+  const dims = [...document.querySelectorAll(".pb-dim:checked")].map((x) => x.value);
+  if (!modelId) return alert("请先在资产库添加模型");
+  if (!dims.length) return alert("至少选择一个测试维度");
+  const est = parityDims.filter((d) => dims.includes(d.id)).reduce((n, d) => n + d.cases, 0);
+  if (!confirm(`将为官方模型建立基线，约 ${est} 次请求，确定开始？`)) return;
+  try {
+    const res = await api("/api/parity/baselines", { method: "POST", body: JSON.stringify({
+      name: $("#pb-name").value.trim(), model_id: modelId, dimensions: dims }) });
+    await loadParityBaselines();
+    await waitBaseline(res.baseline_id);
+  } catch (e) { alert(`建立失败: ${e.message}`); }
+};
+
+/* ── 进度反馈 ─────────────────────────── */
+function renderProgress(el, p, label) {
+  if (!el) return;
+  const done = p.done || 0, total = p.total || 0;
+  const pct = total ? Math.min(100, done / total * 100) : 0;
+  const finished = p.status === "ready" || p.status === "finished";
+  const failed = p.status === "failed";
+  el.hidden = false;
+  el.innerHTML =
+    `<b>${label}</b>：${failed ? "❌ 失败" : finished ? "✅ 完成" : "⏳ 进行中（已开始请求）"}　`
+    + `${done}/${total}${total ? `（${pct.toFixed(0)}%）` : ""}`
+    + (p.model ? `　模型：${esc(p.model)}` : "")
+    + (p.current && !finished ? `<br>当前用例：${esc(p.current)}` : "")
+    + (p.last_status != null && !finished ? `<br>上一条返回：HTTP ${p.last_status}` : "")
+    + (p.last_error ? `<br><span style="color:#c62828">上一条错误：${esc(String(p.last_error).slice(0, 160))}</span>` : "")
+    + (p.error && failed ? `<br><span style="color:#c62828">失败原因：${esc(p.error)}</span>` : "")
+    + (failed ? `<br>建议：检查该模型连接的 Base URL / 接口路径 / API Key，或先用「调试」验证连通性。` : "")
+    + `<div class="bar"><i style="width:${pct.toFixed(1)}%"></i></div>`;
+}
+
+async function waitBaseline(baselineId) {
+  const el = $("#pb-progress");
+  renderProgress(el, { status: "running", total: 0, done: 0 }, "建立基线");
+  for (let i = 0; i < 600; i++) {
+    const b = await api(`/api/parity/baselines/${baselineId}`);
+    renderProgress(el, { ...(b.progress || {}), status: b.status, error: b.error }, "建立基线");
+    if (b.status === "ready" || b.status === "failed") {
+      await loadParityBaselines();
+      return b;
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  return null;
+}
+
+async function waitRun(runId) {
+  const el = $("#pr-progress");
+  renderProgress(el, { status: "running", total: 0, done: 0 }, "候选测试");
+  for (let i = 0; i < 600; i++) {
+    const r = await api(`/api/parity/runs/${runId}`);
+    renderProgress(el, { ...(r.progress || {}), status: r.status, error: r.error }, "候选测试");
+    if (r.status === "finished" || r.status === "failed") {
+      await loadParityRuns();
+      if (r.status === "finished") await showParityReport(runId);
+      return r;
+    }
+    await new Promise((res) => setTimeout(res, 1500));
+  }
+  return null;
+}
+
+let pbDetailId = null;   // 当前展开的基线明细（再次点击同一基线即关闭）
+
+/* 原始响应美化：是 JSON 就缩进美化，否则原样展示（报错原文也照原样给出） */
+function prettyRaw(text, fallback = "") {
+  const t = (text || "").trim() || fallback || "";
+  if (!t) {
+    return "（该记录未保存原始响应：多为此记录由旧版本生成或旧版运行。请「重建基线」/重新跑候选后再查看）";
+  }
+  try {
+    return JSON.stringify(JSON.parse(t), null, 2);
+  } catch (e) {
+    return t;
+  }
+}
+
+function closeParityPanels() {
+  $("#pb-detail").innerHTML = "";
+  $("#pb-detail").hidden = true;
+  $("#pr-report").innerHTML = "";
+  $("#pr-report").hidden = true;
+  pbDetailId = null;
+}
+
+window.showBaselineDetail = async (baselineId) => {
+  // 再次点击同一个「查看」→ 折叠关闭
+  if (pbDetailId === baselineId && !$("#pb-detail").hidden) {
+    closeParityPanels();
+    return;
+  }
+  const b = await api(`/api/parity/baselines/${baselineId}`);
+  const rows = b.items_detail || [];
+  const box = { REJECT: "REJECT（拒绝）", ACCEPT_AS_IS: "ACCEPT（接受）",
+                ERROR_OTHER: "5xx", UNKNOWN: "无响应" };
+  // 与候选报告互斥显示，避免两块内容同时铺开
+  $("#pr-report").innerHTML = "";
+  $("#pr-report").hidden = true;
+  pbDetailId = baselineId;
+  $("#pb-detail").hidden = false;
+  $("#pb-detail").innerHTML =
+    `<h3 style="display:flex;justify-content:space-between;align-items:center">
+       基线明细：${esc(b.name)}（${esc(b.model_label)} · ${esc(b.case_set)} · ${rows.length} 条）
+       <button class="ghost" onclick="closeParityPanels()">关闭</button>
+     </h3>`
+    + `<div class="muted">建立时间：${esc(b.created_at)}　维度：${esc(b.dimensions)}　`
+    + `（点每条用例可展开查看实际请求与响应）</div>`
+    + rows.map((r) => `
+      <details class="case-detail">
+        <summary>${r.dimension} | ${esc(r.name)} | HTTP ${r.status_code ?? "—"} | `
+        + `${box[r.behavior_class] || esc(r.behavior_class || "—")} | `
+        + `${r.prompt_tokens ?? 0}/${r.completion_tokens ?? 0} token | ${(r.latency ?? 0).toFixed(2)}s</summary>
+        <div class="probe-cols">
+          <div><h3>实际请求体</h3><pre class="code small">${esc(JSON.stringify(r.request || {}, null, 2))}</pre></div>
+          <div>
+            <h3>实际响应（原始${r.status_code >= 400 ? " · 报错原文" : ""}）</h3>
+            <div class="muted">HTTP ${r.status_code ?? "—"} · ${esc(r.behavior_class || "")} ·
+              ${r.prompt_tokens ?? 0}/${r.completion_tokens ?? 0} token · ${(r.latency ?? 0).toFixed(2)}s</div>
+            <pre class="code small">${esc(prettyRaw(r.raw_response, r.error))}</pre>
+          </div>
+        </div>
+      </details>`).join("");
+  $("#pb-detail").scrollIntoView({ behavior: "smooth", block: "start" });
+};
+
+window.closeParityPanels = closeParityPanels;
+
+["#btn-refresh-pb-models", "#btn-refresh-pr-models"].forEach((sel) => {
+  const el = $(sel);
+  if (el) el.onclick = () => loadModels();
+});
+
+window.deleteParityBaseline = async (id) => {
+  if (!confirm("删除该基线？已产生的运行记录不受影响。")) return;
+  await api(`/api/parity/baselines/${id}`, { method: "DELETE" });
+  await loadParityBaselines();
+};
+
+async function loadParityRuns() {
+  const rows = await api("/api/parity/runs");
+  $("#pr-table tbody").innerHTML = `<tr><th>任务</th><th>候选</th><th>状态</th><th>结论</th><th></th></tr>` +
+    rows.map((r) => `<tr>
+      <td>${r.name}</td><td>${r.model_label}</td>
+      <td>${r.status === "finished" ? "✅ 完成" : r.status === "running" ? "⏳ 运行中" : r.status}</td>
+      <td>${r.verdict || "—"}${r.score != null ? ` (${r.score})` : ""}</td>
+      <td><button onclick="showParityReport(${r.id})">查看</button></td>
+    </tr>`).join("");
+}
+
+$("#btn-create-run").onclick = async () => {
+  const baselineId = Number($("#pr-baseline").value);
+  const modelId = Number($("#pr-model").value);
+  if (!baselineId) return alert("请先建立并选择基线");
+  if (!modelId) return alert("请选择候选模型");
+  try {
+    const res = await api("/api/parity/runs", { method: "POST", body: JSON.stringify({
+      baseline_id: baselineId, model_id: modelId, name: $("#pr-name").value.trim() }) });
+    await loadParityRuns();
+    await waitRun(res.run_id);
+  } catch (e) { alert(`启动失败: ${e.message}`); }
+};
+
+window.showParityReport = async (runId) => {
+  const run = await api(`/api/parity/runs/${runId}`);
+  const rep = run.report || {};
+  if (!rep.verdict) return ($("#pr-report").innerHTML = "<div class='muted'>报告尚未生成（任务可能仍在运行）。</div>");
+  // 与基线明细互斥显示
+  $("#pb-detail").innerHTML = "";
+  $("#pb-detail").hidden = true;
+  pbDetailId = null;
+  $("#pr-report").hidden = false;
+  const icon = { "等价": "🟢", "可疑": "🟠", "不等价": "🔴", "不可比": "⚪" }[rep.verdict] || "";
+  let html = `<h3>${icon} 结论：${rep.verdict}`
+    + (rep.score != null ? ` <span class="muted">等价度 ${rep.score}</span>` : "") + `</h3>`;
+  const gate = rep.gate || {};
+  if (!gate.ok) {
+    html += `<div class="content-box" style="border-color:#f5c2c7;background:#fdecea">`
+      + `<b>不可比，原因：</b><br>` + (gate.reasons || []).map((r) => `· ${esc(r)}`).join("<br>")
+      + `<br><b>建议：</b>` + (gate.suggestions || []).map((s) => `· ${esc(s)}`).join("<br>") + `</div>`;
+  }
+  if (rep.red_flags && rep.red_flags.length) {
+    html += `<div class="content-box" style="border-color:#f5c2c7;background:#fdecea">`
+      + `<b>🚩 一票否决项</b><br>` + rep.red_flags.map((f) => `· ${esc(f)}`).join("<br>") + `</div>`;
+  }
+  html += `<table class="kv"><tr><th>维度</th><th>结论</th><th>指标</th></tr>`
+    + (rep.dimensions || []).map((d) => {
+        const i2 = { green: "🟢", yellow: "🟠", red: "🔴" }[d.verdict] || "";
+        const m = Object.entries(d.metrics || {}).map(([k, v]) => `${k}=${v}`).join("；");
+        return `<tr><th>${d.dimension} ${esc(d.name)}</th><td>${i2}</td><td>${esc(m)}</td></tr>`;
+      }).join("") + `</table>`;
+  html += `<div class="muted">${(rep.cases || []).length} 条用例（点每条可展开查看实际请求与双方响应）</div>`;
+  html += (rep.cases || []).map((c) => {
+        const i3 = { pass: "✅", fail: "❌", skip: "⚠️" }[c.verdict] || "—";
+        const b = c.baseline || {}, t = c.candidate || {};
+        return `<details class="case-detail">
+          <summary>${i3} ${c.dimension} | ${esc(c.name)} | ${esc(c.reason)}</summary>
+          <div class="probe-cols">
+            <div><h3>实际请求体</h3><pre class="code small">${esc(JSON.stringify(c.request || {}, null, 2))}</pre></div>
+            <div><h3>响应对比</h3>
+            </div>
+            <div class="muted">官方：HTTP ${b.status_code ?? "—"} · ${esc(b.behavior_class || "")} ·
+              ${b.prompt_tokens ?? 0}/${b.completion_tokens ?? 0} token</div>
+            <pre class="code small">${esc(prettyRaw(b.raw_response, b.output_text))}</pre>
+            <div class="muted" style="margin-top:8px">候选：HTTP ${t.status_code ?? "—"} · ${esc(t.behavior_class || "")} ·
+              ${t.prompt_tokens ?? 0}/${t.completion_tokens ?? 0} token
+              ${t.error ? ` · ${esc(String(t.error).slice(0, 120))}` : ""}</div>
+            <pre class="code small">${esc(prettyRaw(t.raw_response, t.output_text || t.error))}</pre>
+          </div>
+        </details>`;
+      }).join("");
+  html += `<div class="sect-title">配置快照</div><pre class="code small">${esc(JSON.stringify(rep.config || {}, null, 2))}</pre>`;
+  html += `<button class="ghost" onclick="exportParityMarkdown(${runId})">导出 Markdown 报告</button>`;
+  html += ` <button class="ghost" onclick="closeParityPanels()">关闭</button>`;
+  $("#pr-report").innerHTML = html;
+  $("#pr-report").scrollIntoView({ behavior: "smooth", block: "start" });
+};
+
+window.exportParityMarkdown = async (runId) => {
+  const res = await api(`/api/parity/runs/${runId}/markdown`);
+  const blob = new Blob([res.markdown], { type: "text/markdown;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `parity_report_${runId}.md`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
 (async function init() {
   try {
     await loadConnections();
     await loadModels();
+    await loadParityDimensions();
     await loadPrompts();
     await loadPromptFiles();
     await loadScenarios();

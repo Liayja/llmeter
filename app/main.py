@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .db import init_db
-from .routers import connections, models, prompts, results, scenarios, tasks
+from .routers import connections, models, parity, prompts, results, scenarios, tasks
 from .services import key_store
 from .settings import DEFAULT_HOST, DEFAULT_PORT, STATIC_DIR
 
@@ -17,6 +17,7 @@ app.include_router(connections.router)
 app.include_router(models.router)
 app.include_router(prompts.router)
 app.include_router(scenarios.router)
+app.include_router(parity.router)
 app.include_router(tasks.router)
 app.include_router(results.router)
 

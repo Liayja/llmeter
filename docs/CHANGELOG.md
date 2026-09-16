@@ -6,6 +6,95 @@
 
 ---
 
+## 2026-09-15 — 基准一致性测试（初版，独立于压测）
+
+新增**独立模块**：用官方模型的**基线快照**验证第三方模型资源的行为等价性。与压测完全分开——压测是多并发大量请求测性能指标，本模块是少量用例逐条比对行为。
+
+### 新增：基线与候选执行
+
+- **[`app/services/parity/`](../app/services/parity/)**（与压测的 job_runner 解耦）：
+  - `cases.py`：内置用例集 `parity-v1`，初版覆盖 4 个维度共 17 条用例（D1 参数语义 3 条、D2 指纹 6 条、D8 结构/工具 2 条、D9 协议健壮性 6 条）；
+  - `executor.py`：单用例执行（完整控制 `messages` / `tools` / `tool_choice`），采集输出文本、usage、tool_calls、耗时、**行为类别**（REJECT / ACCEPT_AS_IS / ERROR_OTHER / UNKNOWN）；
+  - `judge.py`：闸门（D0 可比性）→ 逐用例判定 → 维度聚合 → 红旗 → 结论（等价/可疑/不等价/不可比），含可配置权重、阈值与开关；
+  - `runner.py` / `store.py`：基线建立、候选运行与数据落库（`parity_baselines` / `parity_baseline_items` / `parity_runs` / `parity_run_items`）。
+- **官方只跑一次**：建立基线后，多个候选共用同一份快照，候选运行只跑自己，再按 `case_id` 与基线对齐比较。
+
+### 新增：API 与界面
+
+- `GET /api/parity/dimensions`（维度目录，含用例数与权重）、`POST/GET /api/parity/baselines`、`POST/GET /api/parity/runs`、`GET /api/parity/runs/{id}/markdown`；
+- 前端新增**独立页签「一致性基准」**（与「压测」分开）：① 建立基线（勾选维度）② 候选测试 ③ 对比报告（结论 + 红旗 + 维度表 + 逐条用例 + 配置快照 + 导出 Markdown）。
+
+### 判定要点
+
+- **闸门**：用例集/覆盖率/基线时效/候选连通性不通过 → 判「不可比」，报告给出**具体原因与建议**，不显示等价度分数；
+- **一票否决**：tokenizer 指纹偏差 >2%、`max_tokens` 系统性不遵守（>20%）、孤儿/悬空 tool 序列行为与官方不同、工具调用完全不可用；
+- 权重默认合计 100%（D2 20%、D8 15%、D1 12%、D9 10%），加权总分**仅用于排序**，可在配置中关闭。
+
+### 验证
+
+- 两个 mock 服务（"官方"严格校验 tool 序列 + 遵守 max_tokens；"候选"全放行 + 忽略 max_tokens + tokenizer 偏移 5%）：
+  基线 17 条 → 候选运行 → 报告结论 **不等价**（等价度 26.3），红旗正确列出 tokenizer 偏差 4.99%、max_tokens 违规率 33.3%、
+  3 条孤儿 tool 行为类别不一致；维度表 D1/D2/D9 红、D8 绿；
+- 界面实测：页签渲染 4 个维度卡片（名称 / 用例数 / 权重），基线建立按钮与模型下拉正常。
+
+### 优化：一致性的过程反馈与基线明细查看
+
+- 反馈问题：点击「建立基线」后没有任何反馈，只在跑完才看到结果；基线结果也无法查看具体请求情况。
+  - **过程反馈**：后端进度记录补充 `model` / `done` / `total` / `current`（当前用例）/ `last_status`（上一条 HTTP）/ `last_error` / `started_at`；
+    前端在建立基线与候选测试时显示进度条与文字（状态、x/y、百分比、当前用例、上一条返回、失败原因与建议），每 1.5 秒刷新一次；
+  - **基线明细查看**：基线列表新增「查看」，展示每条用例的**维度 / 用例名 / HTTP 状态 / 行为类别（REJECT、ACCEPT…）/ 入出 token / 耗时 / 输出预览**；
+    `GET /api/parity/baselines/{id}` 返回完整明细（含 usage 与错误信息）；
+  - 前端静态资源加版本号（`?v=20260915d`）避免浏览器缓存旧脚本；模型下拉旁新增「刷新」按钮，并给出模型数量的提示文案。
+- 验证：API 轮询实测 `done` 3/9 → 7/9 → 9/9 且带当前用例与 HTTP 状态；界面「查看」正确渲染 9 条明细（首行：D1 | max_tokens 是否被遵守（256）| 200 | ACCEPT | 24 / 20 token | 0.27s | ok）。
+
+### 新增：资产库「连接 / 模型」支持编辑
+
+- 反馈问题：连接与模型配置好后无法修改，改一个小地方（如 Base URL 写错）只能删除重建。
+  - 连接列表与模型列表新增「编辑」按钮：点击后把该条数据**回填到上方表单**，按钮变为「保存修改」，并出现「取消编辑」；
+  - 保存时走已有的 `PUT /api/connections/{id}` / `PUT /api/models/{id}`，不再新建记录；
+  - **密钥处理**：环境变量模式回显变量名；本机加密模式密钥框留空即**保持原密钥不变**（输入框有对应提示），需要更换时再填入新密钥；
+  - 模型编辑支持修改显示名、模型 ID、所属连接、`extra_params`（JSON 会自动格式化回填）。
+- 验证：API 层——连接改名/改 URL/改接口路径后密钥保持不变；模型改显示名与 `extra_params` 生效。
+  界面层——点击「编辑」后表单正确回填（名称、URL、接口路径、环境变量名、模型名、extra_params），按钮切换为「保存修改」且「取消编辑」可见。
+
+### 修复：Base URL / 接口路径填反导致 UnsupportedProtocol
+
+- 现象：跑基准测试（或压测）时报 `UnsupportedProtocol: Request URL is missing an 'http://' or 'https://' protocol`。
+- 原因：连接里 **Base URL 为空、而把完整地址填进了「接口路径」**（实测连接 #5：`base_url=''`、`endpoint='https://api.deepseek.com'`），
+  拼接结果是 `/https://api.deepseek.com` 这种相对路径，httpx 无法识别。
+  - `src/engine.py build_chat_url()` 增加容错：接口路径是完整地址时直接当完整 URL 使用；Base URL 缺协议前缀自动补 `https://`；
+    Base URL 为空时抛出**可执行的明确错误**（提示填哪里），不再让 httpx 抛晦涩异常；
+  - `app/routers/connections.py` 新增 `_normalize_urls()`：保存/编辑连接时自动纠正（完整地址填在接口路径 → 搬到 Base URL；缺协议 → 补 https://；接口路径统一加 `/` 前缀），
+    并在 Base URL 仍为空时返回 400 明确提示；
+  - 前端：Base URL 标注为必填并在保存前校验，接口路径的占位符写明"只填路径"。
+- 验证：`build_chat_url("", "https://api.deepseek.com")` → 返回 `https://api.deepseek.com`；
+  `build_chat_url("open.bigmodel.cn/api/paas", "/v4/chat/completions")` → `https://open.bigmodel.cn/api/paas/v4/chat/completions`；
+  `build_chat_url("", "")` → 明确的 ValueError；保存时三种常见错填均被自动纠正。
+- 处置建议：把该连接的 Base URL 改为 `https://api.deepseek.com`、接口路径改为 `/chat/completions`（或直接点一次「编辑 → 保存修改」，会自动纠正）。
+
+### 优化：一致性结果查看的交互（可折叠 / 互斥显示 / 用例下钻）
+
+- 反馈三个问题：① 基线明细点开后无法关闭，一直占着页面；② 基线明细与候选报告同时展开，页面被拉得很长；③ 无法查看单条用例的实际请求与响应。
+  - **可折叠**：再次点击同一条基线的「查看」即折叠关闭；明细与报告标题栏都新增「关闭」按钮；
+  - **互斥显示**：打开基线明细时自动收起候选报告，打开候选报告时自动收起基线明细，并用 `scrollIntoView` 定位到当前查看区域，不再两块叠加；
+  - **用例下钻**：每个用例改为可展开区块（`<details>`）——基线明细里展开可见**实际请求体（JSON）+ 响应（HTTP / 行为类别 / 入出 token / 耗时 / 输出内容 / usage）**；
+    对比报告里展开可见**实际请求体 + 官方与候选的响应并排对比**（HTTP、行为类别、token、错误、双方输出内容、usage）；
+  - 后端：基线明细接口补充 `request`（实际请求体），报告 `cases` 中补充 `request` 字段。
+- 验证：浏览器实测——点「查看」展开 9 条用例且首条请求体可读；再次点击同一「查看」→ 收起；打开候选报告后基线明细自动隐藏；报告内 9 条用例均可展开查看请求与双方响应。
+
+### 修复：老库缺列导致「table parity_baseline_items has no column named raw_response」
+
+- 现象：升级后重跑基准测试失败，报 `table parity_baseline_items has no column named raw_response`。
+- 原因：新增的 `raw_response`（原始响应体）只写在建表语句里，而 SQLite 的 `CREATE TABLE IF NOT EXISTS` **不会给已存在的表补列**，所以老库缺这一列。
+  - `app/db.py` 新增**统一的轻量迁移机制** `_COLUMN_MIGRATIONS`：启动时逐表检查 `PRAGMA table_info`，缺列就 `ALTER TABLE ADD COLUMN` 并打印迁移日志；
+    覆盖 `connections.endpoint`、`parity_baselines.status/error`、`parity_baseline_items.tool_calls_json/raw_response`、`parity_run_items.tool_calls_json/raw_response`。
+- 验证：构造"旧表结构"的库 → 运行 `init_db()` → 7 个缺失列被自动补齐（含 `raw_response`），随后基线写入与读取正常（`raw_response={"error":{"message":"orphan tool"}}`）。
+- 说明：重启平台即自动迁移，**无需删除数据库**；迁移只做加列，不动既有数据。
+
+> 设计依据见本地文档 `docs/基准一致性测试设计.md`（按约定不入库，随功能同步维护）。
+
+---
+
 ## 2026-09-10 — 本地 Web 压测平台 M1（跑通最小闭环）
 
 在 CLI 之外新增本地 Web 界面，目标是把「配置 → 压测 → 看结果」从命令行搬到浏览器，引擎与指标口径保持不变。

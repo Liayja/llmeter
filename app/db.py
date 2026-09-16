@@ -66,6 +66,75 @@ CREATE TABLE IF NOT EXISTS scenarios (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- ── 基准一致性测试（独立模块，与压测无关）──
+CREATE TABLE IF NOT EXISTS parity_baselines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    model_label TEXT NOT NULL,
+    model TEXT NOT NULL,
+    connection_id INTEGER,
+    case_set TEXT NOT NULL,
+    dimensions TEXT NOT NULL,          -- 逗号分隔，如 D1,D2,D8,D9
+    config_json TEXT NOT NULL,         -- 参数/采样/权重/阈值快照
+    status TEXT NOT NULL DEFAULT 'queued',   -- queued/running/ready/failed
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    notes TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS parity_baseline_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    baseline_id INTEGER NOT NULL,
+    case_id TEXT NOT NULL,
+    dimension TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    output_text TEXT NOT NULL DEFAULT '',
+    raw_response TEXT NOT NULL DEFAULT '',
+    tool_calls_json TEXT NOT NULL DEFAULT '[]',
+    usage_json TEXT NOT NULL DEFAULT '{}',
+    status_code INTEGER,
+    behavior_class TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    latency REAL NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS parity_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    baseline_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    model_label TEXT NOT NULL,
+    model TEXT NOT NULL,
+    connection_id INTEGER,
+    dimensions TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    verdict TEXT NOT NULL DEFAULT '',
+    score REAL,
+    report_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS parity_run_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    case_id TEXT NOT NULL,
+    dimension TEXT NOT NULL,
+    output_text TEXT NOT NULL DEFAULT '',
+    raw_response TEXT NOT NULL DEFAULT '',
+    tool_calls_json TEXT NOT NULL DEFAULT '[]',
+    usage_json TEXT NOT NULL DEFAULT '{}',
+    status_code INTEGER,
+    behavior_class TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    latency REAL NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -83,11 +152,26 @@ def get_conn() -> sqlite3.Connection:
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
-        # 轻量迁移：老库补 endpoint 列
-        cols = {row["name"] for row in conn.execute("PRAGMA table_info(connections)").fetchall()}
-        if "endpoint" not in cols:
-            conn.execute("ALTER TABLE connections ADD COLUMN endpoint TEXT NOT NULL DEFAULT ''")
+        # ── 轻量迁移：CREATE TABLE IF NOT EXISTS 不会给"已存在的表"补列，
+        #    这里按需 ALTER，保证老库升级后不会被新字段卡住 ──
+        for table, column, ddl in _COLUMN_MIGRATIONS:
+            cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if cols and column not in cols:          # 表存在但缺列 → 补
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                print(f"🛠️  数据库迁移：{table} 增加列 {column}")
         conn.commit()
+
+
+# (表名, 列名, 列定义)：老库升级时按需补齐
+_COLUMN_MIGRATIONS = [
+    ("connections", "endpoint", "TEXT NOT NULL DEFAULT ''"),
+    ("parity_baselines", "status", "TEXT NOT NULL DEFAULT 'queued'"),
+    ("parity_baselines", "error", "TEXT NOT NULL DEFAULT ''"),
+    ("parity_baseline_items", "tool_calls_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("parity_baseline_items", "raw_response", "TEXT NOT NULL DEFAULT ''"),
+    ("parity_run_items", "tool_calls_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("parity_run_items", "raw_response", "TEXT NOT NULL DEFAULT ''"),
+]
 
 
 def query_all(sql: str, params: tuple = ()) -> list[dict]:

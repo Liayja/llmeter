@@ -8,6 +8,26 @@ from ..services import probe as probe_service
 router = APIRouter(prefix="/api/connections", tags=["connections"])
 
 
+def _normalize_urls(base_url: str, endpoint: str) -> tuple[str, str]:
+    """规整 Base URL 与接口路径，修正常见的"两个字段填反"：
+
+    - 若 Base URL 为空、而接口路径是完整地址 → 把它搬到 Base URL；
+    - Base URL 缺协议前缀 → 补 https://；
+    - 接口路径保持"只填路径"的语义（完整地址会被搬到 Base URL）。
+    """
+    base = (base_url or "").strip().rstrip("/")
+    ep = (endpoint or "").strip()
+    if not base and ep.startswith(("http://", "https://")):
+        base, ep = ep.rstrip("/"), ""
+    elif ep.startswith(("http://", "https://")):
+        ep = ""
+    if base and not base.startswith(("http://", "https://")):
+        base = "https://" + base
+    if ep and not ep.startswith("/"):
+        ep = "/" + ep
+    return base, ep
+
+
 class ConnectionIn(BaseModel):
     name: str
     base_url: str
@@ -38,10 +58,13 @@ def list_connections() -> list[dict]:
 
 @router.post("")
 def create_connection(payload: ConnectionIn) -> dict:
+    base_url, endpoint = _normalize_urls(payload.base_url, payload.endpoint)
+    if not base_url:
+        raise HTTPException(400, "Base URL 不能为空，请填写完整地址，例如 https://api.deepseek.com")
     key_ref = payload.env_var if payload.key_mode == "env" else key_store.protect(payload.api_key)
-    new_id = catalog.create_connection(payload.name, payload.base_url.rstrip("/"),
+    new_id = catalog.create_connection(payload.name, base_url,
                                       payload.key_mode, key_ref, payload.note,
-                                      payload.endpoint.strip())
+                                      endpoint)
     return _public(catalog.get_connection(new_id))
 
 
@@ -50,12 +73,15 @@ def update_connection(conn_id: int, payload: ConnectionIn) -> dict:
     old = catalog.get_connection(conn_id)
     if not old:
         raise HTTPException(404, "连接不存在")
+    base_url, endpoint = _normalize_urls(payload.base_url, payload.endpoint)
+    if not base_url:
+        raise HTTPException(400, "Base URL 不能为空，请填写完整地址，例如 https://api.deepseek.com")
     if payload.key_mode == "env":
         key_ref = payload.env_var or old.get("key_ref", "")
     else:
         key_ref = key_store.protect(payload.api_key) if payload.api_key else old.get("key_ref", "")
-    catalog.update_connection(conn_id, payload.name, payload.base_url.rstrip("/"),
-                             payload.key_mode, key_ref, payload.note, payload.endpoint.strip())
+    catalog.update_connection(conn_id, payload.name, base_url,
+                             payload.key_mode, key_ref, payload.note, endpoint)
     return _public(catalog.get_connection(conn_id))
 
 

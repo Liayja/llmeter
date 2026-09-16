@@ -33,6 +33,16 @@ def build_chat_url(base_url: str, endpoint: str | None = None) -> str:
     """
     base = (base_url or "").strip().rstrip("/")
     path = (endpoint or DEFAULT_CHAT_PATH).strip()
+    # 容错 1：接口路径里填了完整地址（用户常见的填反）→ 直接当完整 URL 用
+    if path.startswith(("http://", "https://")):
+        return path.rstrip("/")
+    # 容错 2：Base URL 为空 → 给出可执行的明确错误，而不是让 httpx 抛 UnsupportedProtocol
+    if not base:
+        raise ValueError("Base URL 未配置（为空）：请在「资产库 → 连接」里填写，例如 https://api.deepseek.com；"
+                         "接口路径只填 /chat/completions 这类路径")
+    # 容错 3：Base URL 少了协议前缀（如 open.bigmodel.cn/api/paas）→ 补 https://
+    if not base.startswith(("http://", "https://")):
+        base = "https://" + base
     if not path.startswith("/"):
         path = "/" + path
     # 用户直接粘贴了完整的 chat/completions 地址
