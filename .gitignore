@@ -26,6 +26,10 @@ docs/基准一致性测试设计.md
 # UI 设计规范（仅本地保留，不纳入仓库）
 docs/UI设计规范.md
 
+# 前端工程（Vue3）构建产物与依赖
+app/web/node_modules/
+app/web/dist/
+
 # IDE / 编辑器
 .vscode/
 .idea/

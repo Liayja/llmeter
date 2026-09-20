@@ -54,7 +54,7 @@ python bench.py scenarios -f config/scenarios.yaml
 conda env create -f environment.yml
 
 # 2. 启动平台
-conda run -n llmeter python -m app.main          # 默认 http://127.0.0.1:8765
+conda run -n llmeter python -m app.main          # 默认 http://127.0.0.1:8781
 conda run -n llmeter python -m app.main --port 9000   # 换端口
 ```
 

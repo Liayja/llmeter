@@ -34,12 +34,59 @@ def _strip_fences(text: str) -> str:
     return t.strip()
 
 
+_OPERATIONAL_STATUS = {401, 403, 429}
+
+
+def _status(item: dict) -> int | None:
+    value = (item or {}).get("status_code")
+    return value if isinstance(value, int) else None
+
+
+def _operational_failure(item: dict) -> bool:
+    """鉴权、限流、服务端错误和连接失败都不属于模型行为差异。"""
+    if not item:
+        return True
+    status = _status(item)
+    if item.get("error") and status is None:
+        return True
+    if status is None or status >= 500 or status in _OPERATIONAL_STATUS:
+        return True
+    return False
+
+
+def _baseline_valid(case: dict, item: dict) -> bool:
+    """官方基线必须提供可用证据；D9 的 4xx 是预期行为，其他维度要求 2xx。"""
+    if _operational_failure(item):
+        return False
+    status = _status(item)
+    if case.get("dimension") == "D9":
+        return status is not None and 200 <= status < 500
+    return status is not None and 200 <= status < 300
+
+
+def _fail_reason(status: int | None) -> str:
+    if status is None:
+        return "候选没有返回 HTTP 状态"
+    return f"候选返回 HTTP {status}，期望成功响应"
+
+
 # ── 逐用例判定 ────────────────────────────────────────────────
 def judge_case(case: dict, ref: dict, cand: dict) -> dict:
     """返回 {verdict: pass/fail/skip, reason: str, metric: float|None}"""
     rule = case.get("judge")
-    if not cand or cand.get("error") and not cand.get("status_code"):
-        return {"verdict": "fail", "reason": f"候选请求异常：{cand.get('error', '')[:120]}", "metric": None}
+    if not _baseline_valid(case, ref):
+        return {"verdict": "inconclusive", "reason": "官方基线证据不可用", "metric": None}
+    if _operational_failure(cand):
+        reason = "候选请求异常"
+        if cand.get("error"):
+            reason += f"：{str(cand.get('error'))[:120]}"
+        elif _status(cand) is not None:
+            reason += f"：HTTP {_status(cand)}"
+        return {"verdict": "inconclusive", "reason": reason, "metric": None}
+    if case.get("dimension") != "D9" and not (
+        _status(cand) is not None and 200 <= _status(cand) < 300
+    ):
+        return {"verdict": "fail", "reason": _fail_reason(_status(cand)), "metric": None}
 
     if rule == "tokenizer_fingerprint":
         base_tok, cand_tok = _num(ref.get("prompt_tokens")), _num(cand.get("prompt_tokens"))
@@ -113,6 +160,10 @@ def judge_case(case: dict, ref: dict, cand: dict) -> dict:
 
     if rule == "behavior_class":
         base_cls, cand_cls = ref.get("behavior_class", ""), cand.get("behavior_class", "")
+        if base_cls in ("ERROR_OTHER", "UNKNOWN") or cand_cls in ("ERROR_OTHER", "UNKNOWN"):
+            return {"verdict": "inconclusive",
+                    "reason": f"行为类别包含服务异常或无响应：官方 {base_cls} / 候选 {cand_cls}",
+                    "metric": None}
         same = base_cls == cand_cls
         reason = f"行为类别：官方 {base_cls} / 候选 {cand_cls}"
         if same and cand_cls == "ACCEPT_AS_IS":
@@ -135,35 +186,65 @@ def aggregate_dimension(dim: str, results: list[dict], cfg: dict) -> dict:
     graded = [r for r in results if r["verdict"] in ("pass", "fail")]
     total = len(graded)
     passed = sum(1 for r in graded if r["verdict"] == "pass")
-    metrics: dict = {"cases": len(results), "graded": total, "passed": passed}
+    inconclusive = sum(1 for r in results if r["verdict"] == "inconclusive")
+    metrics: dict = {
+        "cases": len(results),
+        "graded": total,
+        "passed": passed,
+        "inconclusive": inconclusive,
+    }
     thresholds = cfg.get("thresholds", {})
 
     if dim == "D1":
-        viol = [r for r in graded if r["verdict"] == "fail" and r.get("metric") not in (None, 0)]
-        rate = (len(viol) / total * 100) if total else 0
+        max_rows = [r for r in graded if r["case_id"] == "D1-max-tokens"]
+        viol = [r for r in max_rows if r["verdict"] == "fail"]
+        rate = (len(viol) / len(max_rows) * 100) if max_rows else 0
         metrics["max_tokens_violation_rate"] = round(rate, 1)
-        verdict = _grade(rate, thresholds.get("D1_max_tokens_violation", [5, 20]))
+        metrics["max_tokens_evidence"] = len(max_rows)
+        if not max_rows:
+            verdict = "gray"
+        else:
+            rate_verdict = _grade(rate, thresholds.get("D1_max_tokens_violation", [5, 20]))
+            pass_rate = (passed / total * 100) if total else 0
+            metrics["pass_rate"] = round(pass_rate, 1)
+            verdict = rate_verdict if rate_verdict != "green" else (
+                "green" if pass_rate == 100 else "yellow"
+            )
     elif dim == "D2":
         devs = [r["metric"] for r in graded if r.get("metric") is not None]
-        mean_dev = sum(devs) / len(devs) if devs else 0
-        metrics["tokenizer_mean_deviation"] = round(mean_dev, 2)
-        metrics["tokenizer_max_deviation"] = round(max(devs), 2) if devs else 0
-        verdict = _grade(mean_dev, thresholds.get("D2_tokenizer_deviation", [1, 2]))
+        if not devs:
+            verdict = "gray"
+        else:
+            mean_dev = sum(devs) / len(devs)
+            metrics["tokenizer_mean_deviation"] = round(mean_dev, 2)
+            metrics["tokenizer_max_deviation"] = round(max(devs), 2)
+            verdict = _grade(mean_dev, thresholds.get("D2_tokenizer_deviation", [1, 2]))
     elif dim == "D8":
-        cand_rate = (passed / total * 100) if total else 0
-        base_pass = sum(1 for r in results if r.get("ref_verdict") == "pass")
-        base_rate = (base_pass / total * 100) if total else 0
-        diff = base_rate - cand_rate
-        metrics["candidate_pass_rate"] = round(cand_rate, 1)
-        metrics["baseline_pass_rate"] = round(base_rate, 1)
-        metrics["pass_rate_diff"] = round(diff, 1)
-        verdict = _grade(diff, thresholds.get("D8_pass_rate_diff", [5, 10]))
+        valid = [
+            r for r in results
+            if r["verdict"] in ("pass", "fail") and r.get("ref_verdict") in ("pass", "fail")
+        ]
+        if not valid:
+            verdict = "gray"
+        else:
+            cand_rate = sum(1 for r in valid if r["verdict"] == "pass") / len(valid) * 100
+            base_rate = sum(1 for r in valid if r.get("ref_verdict") == "pass") / len(valid) * 100
+            diff = base_rate - cand_rate
+            metrics["candidate_pass_rate"] = round(cand_rate, 1)
+            metrics["baseline_pass_rate"] = round(base_rate, 1)
+            metrics["pass_rate_diff"] = round(diff, 1)
+            verdict = _grade(diff, thresholds.get("D8_pass_rate_diff", [5, 10]))
     elif dim == "D9":
-        match_rate = (passed / total * 100) if total else 0
-        metrics["behavior_match_rate"] = round(match_rate, 1)
-        verdict = _grade(match_rate, thresholds.get("D9_behavior_match", [95, 80]), higher_better=True)
+        if not graded:
+            verdict = "gray"
+        else:
+            match_rate = (passed / total * 100) if total else 0
+            metrics["behavior_match_rate"] = round(match_rate, 1)
+            verdict = _grade(
+                match_rate, thresholds.get("D9_behavior_match", [95, 80]), higher_better=True,
+            )
     else:
-        verdict = "yellow"
+        verdict = "gray"
 
     return {"dimension": dim, "name": name, "verdict": verdict, "metrics": metrics,
             "cases": results}
@@ -175,23 +256,34 @@ def build_report(*, baseline: dict, run: dict, cases: list[dict], ref_items: dic
     # ── 闸门（D0）──
     gate_reasons: list[str] = []
     gate_suggestions: list[str] = []
-    covered = [c["id"] for c in cases if c["id"] in ref_items]
-    coverage = len(covered) / len(cases) * 100 if cases else 0
+    baseline_valid = [
+        c["id"] for c in cases
+        if _baseline_valid(c, ref_items.get(c["id"], {}))
+    ]
+    baseline_invalid = [c["id"] for c in cases if c["id"] not in baseline_valid]
+    candidate_inconclusive = [
+        c["id"] for c in cases if _operational_failure(cand_items.get(c["id"], {}))
+    ]
+    coverage = len(baseline_valid) / len(cases) * 100 if cases else 0
     if baseline.get("case_set") != CASE_SET:
         gate_reasons.append(f"用例集不一致：基线 {baseline.get('case_set')} / 当前 {CASE_SET}")
         gate_suggestions.append("重选基线或重建基线")
     if coverage < 95:
-        missing = [c["id"] for c in cases if c["id"] not in ref_items][:5]
-        gate_reasons.append(f"基线覆盖率不足：{len(covered)}/{len(cases)}（缺少 {', '.join(missing)} …）")
-        gate_suggestions.append("补齐基线（只跑缺失用例）")
+        gate_reasons.append(
+            f"基线可用证据不足：{len(baseline_valid)}/{len(cases)}"
+            f"（问题用例 {', '.join(baseline_invalid[:5])} …）"
+        )
+        gate_suggestions.append("重建基线，并确认鉴权、限流、超时和服务端状态正常")
     if baseline_age_days is not None and baseline_age_days > cfg.get("baseline_max_age_days", 30):
         gate_reasons.append(f"基线创建于 {baseline_age_days:.0f} 天前，官方模型可能已变更")
         gate_suggestions.append("建议重建基线")
-    all_unknown = all((cand_items.get(c["id"], {}).get("behavior_class") == "UNKNOWN") for c in cases) if cases else True
-    if all_unknown and cases:
-        gate_reasons.append("候选全部请求失败（鉴权/连通/超时），无法比对")
-        gate_suggestions.append("检查候选连接的 Base URL / 接口路径 / API Key")
-    gate_ok = not any("覆盖率不足" in r or "全部请求失败" in r or "用例集不一致" in r for r in gate_reasons)
+    if candidate_inconclusive:
+        gate_reasons.append(
+            f"候选存在 {len(candidate_inconclusive)} 条不可判断请求"
+            f"（鉴权/限流/5xx/超时）：{', '.join(candidate_inconclusive[:5])} …"
+        )
+        gate_suggestions.append("检查候选连接的 Base URL / 接口路径 / API Key、限流和服务端状态")
+    gate_ok = not gate_reasons
 
     # ── 逐用例判定 ──
     case_results: list[dict] = []
@@ -200,17 +292,26 @@ def build_report(*, baseline: dict, run: dict, cases: list[dict], ref_items: dic
         cand = cand_items.get(case["id"], {})
         ref_verdict = judge_case(case, ref, ref)      # 基线自身是否满足该用例的"期望"
         res = judge_case(case, ref, cand)
+        if not _baseline_valid(case, ref):
+            evidence_status = "baseline_invalid"
+        elif _operational_failure(cand):
+            evidence_status = "candidate_inconclusive"
+        else:
+            evidence_status = "comparable"
         case_results.append({
             "case_id": case["id"], "dimension": case["dimension"], "name": case["name"],
             "request": case.get("payload", {}),          # 实际发出的请求体（两侧一致）
             "verdict": res["verdict"], "reason": res["reason"], "metric": res.get("metric"),
             "ref_verdict": ref_verdict["verdict"],
+            "evidence_status": evidence_status,
             "baseline": {k: ref.get(k) for k in ("status_code", "behavior_class", "prompt_tokens",
                                                 "completion_tokens", "output_text", "raw_response",
-                                                "usage", "latency")},
+                                                "raw_response_truncated", "output_text_truncated",
+                                                "param_notes", "usage", "latency", "error")},
             "candidate": {k: cand.get(k) for k in ("status_code", "behavior_class", "prompt_tokens",
                                                   "completion_tokens", "output_text", "raw_response",
-                                                  "usage", "error", "latency")},
+                                                  "raw_response_truncated", "output_text_truncated",
+                                                  "param_notes", "usage", "error", "latency")},
         })
 
     # ── 维度聚合 ──
@@ -219,6 +320,13 @@ def build_report(*, baseline: dict, run: dict, cases: list[dict], ref_items: dic
         rows = [r for r in case_results if r["dimension"] == dim]
         if rows:
             dims.append(aggregate_dimension(dim, rows, cfg))
+    gray_dims = [d["dimension"] for d in dims if d["verdict"] == "gray"]
+    if gray_dims:
+        gate_reasons.append(
+            f"以下维度缺少可判定证据：{', '.join(gray_dims)}"
+        )
+        gate_suggestions.append("检查缺失的 usage/输出字段，并重新运行候选测试")
+        gate_ok = False
 
     # ── 红旗（一票否决）──
     red_flags: list[str] = []
@@ -242,7 +350,10 @@ def build_report(*, baseline: dict, run: dict, cases: list[dict], ref_items: dic
     # ── 结论 ──
     yellow_count = sum(1 for d in dims if d["verdict"] == "yellow")
     red_count = sum(1 for d in dims if d["verdict"] == "red")
+    gray_count = sum(1 for d in dims if d["verdict"] == "gray")
     if not gate_ok:
+        verdict = "不可比"
+    elif gray_count:
         verdict = "不可比"
     elif red_flags or red_count:
         verdict = "不等价"
@@ -255,14 +366,22 @@ def build_report(*, baseline: dict, run: dict, cases: list[dict], ref_items: dic
     if cfg.get("enable_weighted_score", True) and dims:
         weights = cfg.get("weights", {})
         dim_score = {"green": 100.0, "yellow": 60.0, "red": 0.0}
-        wsum = sum(_num(weights.get(d["dimension"], 0)) for d in dims) or 1
-        score = round(sum(dim_score[d["verdict"]] * _num(weights.get(d["dimension"], 0)) for d in dims) / wsum, 1)
+        scored = [d for d in dims if d["verdict"] in dim_score]
+        wsum = sum(_num(weights.get(d["dimension"], 0)) for d in scored) or 1
+        if scored:
+            score = round(
+                sum(dim_score[d["verdict"]] * _num(weights.get(d["dimension"], 0)) for d in scored)
+                / wsum,
+                1,
+            )
 
     return {
         "verdict": verdict,
         "score": score,
         "gate": {"ok": gate_ok, "reasons": gate_reasons, "suggestions": gate_suggestions,
-                 "coverage": round(coverage, 1)},
+                 "coverage": round(coverage, 1),
+                 "baseline_invalid": baseline_invalid,
+                 "candidate_inconclusive": candidate_inconclusive},
         "red_flags": red_flags,
         "dimensions": [{k: v for k, v in d.items() if k != "cases"} for d in dims],
         "cases": case_results,

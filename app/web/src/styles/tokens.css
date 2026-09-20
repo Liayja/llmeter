@@ -1,0 +1,47 @@
+/* 设计令牌：紧凑专业 · 高信息密度（详见 docs/UI设计规范.md） */
+:root {
+  --c-primary: #2f5496;
+  --c-success: #2e7d32;
+  --c-warning: #e65100;
+  --c-danger: #c62828;
+  --c-text-1: #1f2937;
+  --c-text-2: #4b5563;
+  --c-text-3: #9aa4b2;
+  --c-bg: #f5f7fa;
+  --c-surface: #ffffff;
+  --c-surface-2: #fafbfd;
+  --c-border: #d9dee5;
+  --c-success-bg: #e8f5e9;
+  --c-warning-bg: #fff4e5;
+  --c-danger-bg: #fdecea;
+
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px;
+  --fs-xs: 12px; --fs-sm: 13px; --fs-base: 14px; --fs-lg: 16px; --fs-xl: 20px;
+  --r-sm: 4px; --r-md: 6px; --r-lg: 8px;
+  --sh-card: 0 1px 2px rgba(0, 0, 0, .04);
+  --sh-pop: 0 8px 24px rgba(0, 0, 0, .12);
+
+  /* Element Plus 主题对齐 */
+  --el-color-primary: var(--c-primary);
+  --el-color-success: var(--c-success);
+  --el-color-warning: var(--c-warning);
+  --el-color-danger: var(--c-danger);
+  --el-border-radius-base: var(--r-md);
+  --el-font-size-base: var(--fs-base);
+}
+
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+body {
+  font-family: "Microsoft YaHei", system-ui, sans-serif;
+  font-size: var(--fs-base);
+  color: var(--c-text-1);
+  background: var(--c-bg);
+}
+/* 数字等宽对齐，便于表格比对 */
+.mono, .el-table .cell { font-variant-numeric: tabular-nums; }
+pre.code {
+  background: #1e2430; color: #c8d3e0; font-size: var(--fs-xs);
+  padding: var(--sp-3); border-radius: var(--r-md);
+  max-height: 320px; overflow: auto; white-space: pre-wrap; margin: 0;
+}

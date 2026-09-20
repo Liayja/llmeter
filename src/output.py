@@ -194,7 +194,10 @@ _COMPARE_COLS = [
     ("目标QPS",   lambda r: r.get("qps_target"),             lambda v: f"{v:g}" if v is not None else "—"),
     ("并发",      _concurrency_cell,                         str),
     ("请求数",    lambda r: r["total"],                      str),
-    ("入Token",   lambda r: r.get("avg_input_tokens"),       lambda v: str(v) if v is not None else "—"),
+    ("目标入Token", lambda r: r.get("target_input_tokens"),    lambda v: f"{v:,}" if v is not None else "—"),
+    ("实际入Token", lambda r: r.get("avg_input_tokens"),       lambda v: f"{v:,}" if v is not None else "—"),
+    ("输入偏差",  lambda r: r.get("input_token_deviation_pct"),
+                  lambda v: f"{v:+.1f}%" if v is not None else "—"),
     ("出Token",   lambda r: r.get("avg_output_tokens"),      lambda v: str(v) if v is not None else "—"),
     ("总Token",   lambda r: r.get("total_tokens"),             lambda v: f"{v:,}" if v is not None else "—"),
     ("缓存命中",  lambda r: r.get("cache_hit_rate"),          lambda v: f"{v:.1f}%" if v is not None else "—"),
@@ -323,7 +326,9 @@ _METRIC_HELP = {
     "目标QPS": "开环模式设定的恒定到达率(req/s)；闭环场景此列为空",
     "并发": "闭环=设定的并发上限；开环以 ~N 表示实测在途峰值(积压水位，非设定值)",
     "请求数": "总共发送了多少次请求",
-    "入Token": "每次请求平均消耗的输入 Token 数（输入越长数值越大）",
+    "目标入Token": "场景按本地 tokenizer 估算的目标输入 Token 数，用于校准阶梯场景",
+    "实际入Token": "模型实际返回的 usage.prompt_tokens 平均值；跨模型比较应以该列为准",
+    "输入偏差": "实际输入 Token 相对目标输入的偏差百分比；绝对值超过 10% 时建议标记为输入规模不完全可比",
     "出Token": "每次成功请求平均生成的输出 Token 数",
     "总Token": "该场景总共消耗的 Token 数（≈ 花了多少额度）",
     "缓存命中": "缓存命中率：命中的缓存 token 占输入 token 的比例（0~100%）。0% 表示未命中或未启用"
@@ -370,7 +375,9 @@ def _build_excel_col(col_def):
         "目标QPS":   ("目标QPS", "req/s"),
         "并发":      ("并发", ""),
         "请求数":    ("请求数", ""),
-        "入Token":   ("入Token", ""),
+        "目标入Token": ("目标入Token", ""),
+        "实际入Token": ("实际入Token", ""),
+        "输入偏差":  ("输入偏差", "%"),
         "出Token":   ("出Token", ""),
         "总Token":   ("总Token", ""),
         "缓存命中":  ("缓存命中", "%"),
@@ -417,8 +424,10 @@ def _build_excel_col(col_def):
         return (display_header, getter, lambda r: (getter(r) * 1000) if getter(r) is not None else None, "0.0", False, header)
     if header == "长尾比":
         return (display_header, getter, getter, "0.00", False, header)
-    if header in ("入Token", "出Token", "总Token", "重试", "未完成", "HTTP错误"):
+    if header in ("目标入Token", "实际入Token", "出Token", "总Token", "重试", "未完成", "HTTP错误"):
         return (display_header, getter, lambda r: getter(r) if getter(r) is not None else None, "#,##0", None, header)
+    if header == "输入偏差":
+        return (display_header, getter, lambda r: getter(r) if getter(r) is not None else None, '+0.0"%";-0.0"%"', None, header)
     return (display_header, getter, lambda r: getter(r), None, None, header)
 
 
@@ -434,7 +443,8 @@ def _excel_blocks(show_model: bool):
 
     blocks = [
         ("基本信息",   "2F5496", pick("场景", "模式", "目标QPS", "并发", "请求数",
-                                      "入Token", "出Token", "总Token", "缓存命中")),
+                                      "目标入Token", "实际入Token", "输入偏差",
+                                      "出Token", "总Token", "缓存命中")),
         ("吞吐 & 延迟", "2E7D32", pick("成功率", "重试", "未完成", "HTTP错误",
                                       "QPS", "TPS",
                                       "延迟Avg", "延迟Std", "延迟P50",
@@ -928,6 +938,61 @@ def save_excel(all_rows: list, groups: dict[str, list], model: str, output_dir: 
             lines.append(f"⚡ 首字时间(TTFT)：平均 {statistics.mean(vals):.3f}s；"
                          f"最快 {label(best)} {best['ttft_avg']:.3f}s / "
                          f"最慢 {label(worst)} {worst['ttft_avg']:.3f}s")
+
+        # 输入长度阶梯：实际 token 校准 + 每 1k 输入的 TTFT 增量与退化倍数
+        input_rows = [
+            r for r in rows
+            if r.get("is_input_ladder")
+            and r.get("target_input_tokens")
+            and r.get("avg_input_tokens")
+        ]
+        if input_rows:
+            deviations = [
+                abs(r["input_token_deviation_pct"])
+                for r in input_rows
+                if r.get("input_token_deviation_pct") is not None
+            ]
+            if deviations and max(deviations) > 10:
+                lines.append(
+                    f"🧪 输入校准：最大实际/目标 token 偏差 {max(deviations):.1f}%；"
+                    "偏差较大的场景不宜直接横向比较"
+                )
+
+            use_ttft = all(r.get("ttft_p95") is not None for r in input_rows)
+            metric_key = "ttft_p95" if use_ttft else "latency_p95"
+            metric_name = "TTFT P95" if use_ttft else "延迟 P95"
+            buckets: dict[tuple, list] = {}
+            for r in input_rows:
+                value = r.get(metric_key)
+                tokens = r.get("avg_input_tokens")
+                if value is None or not tokens:
+                    continue
+                model_name = r.get("model_label") or r.get("_model") or "单模型"
+                key = (model_name, r.get("concurrency"))
+                buckets.setdefault(key, []).append(r)
+            slopes = []
+            for (model_name, concurrency), series in buckets.items():
+                if len(series) < 2:
+                    continue
+                series = sorted(series, key=lambda r: r["avg_input_tokens"])
+                lo, hi = series[0], series[-1]
+                token_delta_k = (hi["avg_input_tokens"] - lo["avg_input_tokens"]) / 1000
+                time_delta = hi[metric_key] - lo[metric_key]
+                if token_delta_k <= 0:
+                    continue
+                slope_ms = time_delta / token_delta_k * 1000
+                ratio = (hi[metric_key] / lo[metric_key]) if lo[metric_key] > 0 else None
+                name = f"{model_name} c{concurrency}" if multi_model else f"并发 {concurrency}"
+                slopes.append((name, slope_ms, ratio, lo, hi))
+            if slopes:
+                slopes.sort(key=lambda item: item[1], reverse=True)
+                shown = []
+                for name, slope_ms, ratio, lo, hi in slopes[:3]:
+                    text = f"{name} {slope_ms:+.0f}ms/1k"
+                    if ratio is not None:
+                        text += f"（{hi['avg_input_tokens']:,}/{lo['avg_input_tokens']:,} token 约 {ratio:.1f}倍）"
+                    shown.append(text)
+                lines.append(f"📐 输入扩展（{metric_name}）：" + "；".join(shown))
 
         # 吞吐：最高行 + 平均
         with_qps = [r for r in rows if r.get("qps", 0) > 0]

@@ -98,7 +98,7 @@ async def run_chat(spec: dict, on_progress=None, on_engine=None) -> dict:
         new_xlsx = sorted(_snapshot(output_dir, "*.xlsx") - before_xlsx)
         excel_path = str(new_xlsx[-1]) if new_xlsx else None
     except Exception as e:   # Excel 失败不影响主流程
-        print(f"⚠️ 生成 Excel 失败: {e}")
+        print(f"[warn] 生成 Excel 失败: {e}")
 
     return {
         "metrics": metrics,
@@ -124,7 +124,12 @@ async def run_scenarios(spec: dict, on_progress=None, on_engine=None,
     scenarios = spec.get("scenarios") or []
     defaults = dict(spec.get("defaults") or {})
     output_dir = spec.get("output_dir") or defaults.get("output_dir") or "bench_results"
-    total = len(models) * len(scenarios)
+    levels = sorted({
+        int(x) for x in (defaults.get("concurrency_levels")
+                         or [defaults.get("concurrency", 10)])
+        if int(x) > 0
+    }) or [int(defaults.get("concurrency", 10))]
+    total = len(models) * len(scenarios) * len(levels)
     rows: list[dict] = []
     idx = 0
     canceled = False
@@ -134,56 +139,85 @@ async def run_scenarios(spec: dict, on_progress=None, on_engine=None,
 
     for model in models:
         for sc in scenarios:
-            if _cancelled():
-                canceled = True
-                break
-            idx += 1
-            scene_name = sc.get("name") or f"场景{idx}"
-            merged = {**defaults}
-            merged.update(sc.get("prompt") and {"prompt": sc["prompt"]} or {})
-            merged.update(sc.get("prompt_file") and {"prompt_file": sc["prompt_file"]} or {})
-            merged.update(sc.get("overrides") or {})
-            cfg = build_engine_config({
-                "model": model["model"],
-                "base_url": model["base_url"],
-                "endpoint": model.get("endpoint"),      # 关键：厂商自定义路径必须透传
-                "api_key": model.get("api_key") or "",
-                "extra_params": model.get("extra_params"),
-                "output_dir": output_dir,
-                "prompt": merged.get("prompt"),
-                "prompt_file": merged.get("prompt_file"),
-                **{k: v for k, v in merged.items() if k not in ("prompt", "prompt_file")},
-            })
+            scene_name = sc.get("name") or "未命名场景"
+            for level in levels:
+                if _cancelled():
+                    canceled = True
+                    break
+                idx += 1
+                merged = {**defaults}
+                merged.update(sc.get("prompt") and {"prompt": sc["prompt"]} or {})
+                merged.update(sc.get("prompt_file") and {"prompt_file": sc["prompt_file"]} or {})
+                merged.update(sc.get("overrides") or {})
+                # 阶梯矩阵的并发点优先级最高，避免场景 overrides 覆盖矩阵设置。
+                merged["concurrency"] = level
+                target_prompt = resolve_prompt(merged)
+                target_input_tokens = count_tokens(target_prompt) if target_prompt else 0
+                cfg = build_engine_config({
+                    "model": model["model"],
+                    "base_url": model["base_url"],
+                    "endpoint": model.get("endpoint"),      # 关键：厂商自定义路径必须透传
+                    "api_key": model.get("api_key") or "",
+                    "extra_params": model.get("extra_params"),
+                    "output_dir": output_dir,
+                    "prompt": merged.get("prompt"),
+                    "prompt_file": merged.get("prompt_file"),
+                    **{k: v for k, v in merged.items() if k not in ("prompt", "prompt_file")},
+                })
+                scene_display = f"{scene_name} · {level}并发"
 
-            def _progress(p: dict, _idx=idx, _scene=scene_name) -> None:
-                if on_progress is None:
-                    return
-                on_progress({**p, "scene": _scene, "scene_index": _idx, "scenes_total": total})
+                def _progress(p: dict, _idx=idx, _scene=scene_display,
+                              _level=level) -> None:
+                    if on_progress is None:
+                        return
+                    on_progress({
+                        **p,
+                        "scene": _scene,
+                        "scene_name": scene_name,
+                        "scene_index": _idx,
+                        "scenes_total": total,
+                        "concurrency": _level,
+                    })
 
-            engine = LLMBench(**cfg, on_progress=_progress)
-            if on_engine is not None:
-                on_engine(engine)
-            metrics = await engine.run()
-            if metrics.get("canceled"):
-                canceled = True
+                engine = LLMBench(**cfg, on_progress=_progress)
+                if on_engine is not None:
+                    on_engine(engine)
+                metrics = await engine.run()
+                if metrics.get("canceled"):
+                    canceled = True
 
-            row = _row_from_result(scene_name, metrics, cfg["concurrency"])
-            row["_model"] = cfg["model"]
-            row["model_label"] = model.get("label") or cfg["model"]
-            rows.append(row)
-            # 每个场景仍单独落一份 JSON，便于回溯
-            before_json = _snapshot(output_dir, "*.json")
-            save_results(metrics, engine.results,
-                         {**cfg, "chat_url": engine.chat_url}, "chat")
-            new_json = sorted(_snapshot(output_dir, "*.json") - before_json)
-            if new_json:
-                # 同一秒内多个场景的文件名会撞车：补上场景名做区分
-                src = new_json[-1]
-                safe_scene = "".join(c for c in scene_name if c not in '\\/:*?"<>|')
-                try:
-                    src.rename(src.with_name(f"{src.stem}_{safe_scene}{src.suffix}"))
-                except OSError:
-                    pass
+                row = _row_from_result(scene_name, metrics, cfg["concurrency"])
+                row["_model"] = cfg["model"]
+                row["model_label"] = model.get("label") or cfg["model"]
+                row["target_input_tokens"] = target_input_tokens
+                actual_input = row.get("avg_input_tokens")
+                if actual_input is not None and target_input_tokens:
+                    row["input_token_deviation"] = actual_input - target_input_tokens
+                    row["input_token_deviation_pct"] = (
+                        (actual_input - target_input_tokens) / target_input_tokens * 100
+                    )
+                else:
+                    row["input_token_deviation"] = None
+                    row["input_token_deviation_pct"] = None
+                row["is_input_ladder"] = True
+                rows.append(row)
+                # 每个场景/并发点仍单独落一份 JSON，便于回溯
+                before_json = _snapshot(output_dir, "*.json")
+                save_results(metrics, engine.results,
+                             {**cfg, "chat_url": engine.chat_url}, "chat")
+                new_json = sorted(_snapshot(output_dir, "*.json") - before_json)
+                if new_json:
+                    # 同一秒内多个场景的文件名会撞车：补上场景名和并发点区分
+                    src = new_json[-1]
+                    safe_scene = "".join(c for c in scene_name if c not in '\\/:*?"<>|')
+                    try:
+                        src.rename(src.with_name(
+                            f"{src.stem}_{safe_scene}_c{level}{src.suffix}"
+                        ))
+                    except OSError:
+                        pass
+                if canceled:
+                    break
             if canceled:
                 break
         if canceled:
@@ -216,6 +250,7 @@ async def run_scenarios(spec: dict, on_progress=None, on_engine=None,
         comparison_json.write_text(json.dumps(
             {"models": [m.get("label") for m in models],
              "scenarios": [s.get("name") for s in scenarios],
+             "concurrency_levels": levels,
              "rows": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
         summary_path = str(comparison_json)
         result_dir = str(date_dir)

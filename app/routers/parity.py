@@ -85,6 +85,9 @@ def get_baseline(baseline_id: int) -> dict:
             "dimension": case.get("dimension", v.get("dimension", "")),
             "request": request_payload,          # 该用例实际发出的请求体
             "raw_response": v.get("raw_response", ""),   # 原始响应体（含 4xx 报错原文）
+            "raw_response_truncated": bool(v.get("raw_response_truncated")),
+            "output_text_truncated": bool(v.get("output_text_truncated")),
+            "param_notes": v.get("param_notes") or [],
             "status_code": v.get("status_code"),
             "behavior_class": v.get("behavior_class"),
             "prompt_tokens": v.get("prompt_tokens"),
@@ -102,10 +105,20 @@ def get_baseline(baseline_id: int) -> dict:
 
 @router.delete("/baselines/{baseline_id}")
 def delete_baseline(baseline_id: int) -> dict:
-    if not store.get_baseline(baseline_id):
+    baseline = store.get_baseline(baseline_id)
+    if not baseline:
         raise HTTPException(404, "基线不存在")
+    if baseline.get("status") == "running":
+        raise HTTPException(409, "基线正在运行，请先中止任务")
     store.delete_baseline(baseline_id)
     return {"ok": True}
+
+
+@router.post("/baselines/{baseline_id}/cancel")
+def cancel_baseline(baseline_id: int) -> dict:
+    if not store.get_baseline(baseline_id):
+        raise HTTPException(404, "基线不存在")
+    return {"ok": runner.cancel("baseline", baseline_id)}
 
 
 @router.get("/runs")
@@ -118,6 +131,8 @@ async def create_run(payload: RunIn) -> dict:
     baseline = store.get_baseline(payload.baseline_id)
     if not baseline:
         raise HTTPException(404, "基线不存在")
+    if baseline.get("status") != "ready":
+        raise HTTPException(409, "基线尚未就绪，无法开始候选测试")
     dims = payload.dimensions or [d for d in (baseline.get("dimensions") or "").split(",") if d]
     dims = [d for d in dims if d in runner.DIMENSIONS]
     if not dims:
@@ -127,6 +142,13 @@ async def create_run(payload: RunIn) -> dict:
                                     conn=conn, model_row=model_row, dimensions=dims,
                                     config=payload.config)
     return {"run_id": run_id}
+
+
+@router.post("/runs/{run_id}/cancel")
+def cancel_run(run_id: int) -> dict:
+    if not store.get_run(run_id):
+        raise HTTPException(404, "运行不存在")
+    return {"ok": runner.cancel("run", run_id)}
 
 
 @router.get("/runs/{run_id}")
@@ -148,7 +170,10 @@ def run_markdown(run_id: int) -> dict:
     run = store.get_run(run_id)
     if not run:
         raise HTTPException(404, "运行不存在")
-    report = json.loads(run.get("report_json") or "{}")
+    try:
+        report = json.loads(run.get("report_json") or "{}")
+    except Exception:      # noqa: BLE001
+        raise HTTPException(500, "报告数据损坏，无法导出") from None
     if not report:
         raise HTTPException(400, "报告尚未生成")
 
@@ -170,14 +195,14 @@ def run_markdown(run_id: int) -> dict:
 
     lines += ["## 维度结果", "", "| 维度 | 名称 | 结论 | 指标 |", "|------|------|------|------|"]
     for d in report.get("dimensions", []):
-        icon = {"green": "🟢", "yellow": "🟠", "red": "🔴"}.get(d["verdict"], "—")
+        icon = {"green": "🟢", "yellow": "🟠", "red": "🔴", "gray": "⚪"}.get(d["verdict"], "—")
         metrics = "；".join(f"{k}={v}" for k, v in d.get("metrics", {}).items())
         lines.append(f"| {d['dimension']} | {d['name']} | {icon} | {metrics} |")
     lines.append("")
 
     lines += ["## 逐条用例", "", "| 用例 | 维度 | 判定 | 说明 |", "|------|------|------|------|"]
     for c in report.get("cases", []):
-        icon = {"pass": "✅", "fail": "❌", "skip": "⚠️"}.get(c["verdict"], "—")
+        icon = {"pass": "✅", "fail": "❌", "skip": "⚠️", "inconclusive": "⚪"}.get(c["verdict"], "—")
         lines.append(f"| {c['name']} | {c['dimension']} | {icon} | {c['reason']} |")
     lines.append("")
     lines += ["## 配置快照", "", "```json",

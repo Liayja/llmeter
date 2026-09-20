@@ -19,6 +19,7 @@ class TaskIn(BaseModel):
     scenario_ids: list[int] = []       # scenarios 模式：多个场景
     # 单次压测参数（缺省值与 CLI 保持一致）
     concurrency: int = 10
+    concurrency_levels: list[int] = []  # 阶梯矩阵：场景模式下的多个并发点
     requests: int = 100
     timeout: int = 30
     max_tokens: int = 2048
@@ -83,7 +84,9 @@ def create_task(payload: TaskIn) -> dict:
         if not all(models) or not all(scenarios):
             raise HTTPException(400, "模型或场景不存在，请检查选择")
         defaults = {
-            "concurrency": payload.concurrency, "requests": payload.requests,
+            "concurrency": payload.concurrency,
+            "concurrency_levels": payload.concurrency_levels or [payload.concurrency],
+            "requests": payload.requests,
             "timeout": payload.timeout, "max_tokens": payload.max_tokens,
             "temperature": payload.temperature, "stream": payload.stream,
             "warmup": payload.warmup, "retries": payload.retries,
@@ -91,7 +94,11 @@ def create_task(payload: TaskIn) -> dict:
             "http2": payload.http2, "read_timeout": payload.read_timeout,
             "qps": payload.qps, "duration": payload.duration,
         }
-        name = payload.name or f"{len(models)} 模型 × {len(scenarios)} 场景"
+        levels = sorted({int(x) for x in defaults["concurrency_levels"] if int(x) > 0})
+        if not levels:
+            raise HTTPException(400, "至少配置一个并发点")
+        defaults["concurrency_levels"] = levels
+        name = payload.name or f"{len(models)} 模型 × {len(scenarios)} 场景 × {len(levels)} 并发点"
         snapshot = {
             "mode": "scenarios",
             "models": [{

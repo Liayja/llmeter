@@ -91,6 +91,9 @@ CREATE TABLE IF NOT EXISTS parity_baseline_items (
     payload_json TEXT NOT NULL,
     output_text TEXT NOT NULL DEFAULT '',
     raw_response TEXT NOT NULL DEFAULT '',
+    raw_response_truncated INTEGER NOT NULL DEFAULT 0,
+    output_text_truncated INTEGER NOT NULL DEFAULT 0,
+    param_notes_json TEXT NOT NULL DEFAULT '[]',
     tool_calls_json TEXT NOT NULL DEFAULT '[]',
     usage_json TEXT NOT NULL DEFAULT '{}',
     status_code INTEGER,
@@ -126,6 +129,9 @@ CREATE TABLE IF NOT EXISTS parity_run_items (
     dimension TEXT NOT NULL,
     output_text TEXT NOT NULL DEFAULT '',
     raw_response TEXT NOT NULL DEFAULT '',
+    raw_response_truncated INTEGER NOT NULL DEFAULT 0,
+    output_text_truncated INTEGER NOT NULL DEFAULT 0,
+    param_notes_json TEXT NOT NULL DEFAULT '[]',
     tool_calls_json TEXT NOT NULL DEFAULT '[]',
     usage_json TEXT NOT NULL DEFAULT '{}',
     status_code INTEGER,
@@ -150,7 +156,8 @@ def get_conn() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         conn.executescript(SCHEMA)
         # ── 轻量迁移：CREATE TABLE IF NOT EXISTS 不会给"已存在的表"补列，
         #    这里按需 ALTER，保证老库升级后不会被新字段卡住 ──
@@ -158,8 +165,10 @@ def init_db() -> None:
             cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if cols and column not in cols:          # 表存在但缺列 → 补
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-                print(f"🛠️  数据库迁移：{table} 增加列 {column}")
+                print(f"[migration] {table} add column {column}")
         conn.commit()
+    finally:
+        conn.close()
 
 
 # (表名, 列名, 列定义)：老库升级时按需补齐
@@ -169,25 +178,40 @@ _COLUMN_MIGRATIONS = [
     ("parity_baselines", "error", "TEXT NOT NULL DEFAULT ''"),
     ("parity_baseline_items", "tool_calls_json", "TEXT NOT NULL DEFAULT '[]'"),
     ("parity_baseline_items", "raw_response", "TEXT NOT NULL DEFAULT ''"),
+    ("parity_baseline_items", "raw_response_truncated", "INTEGER NOT NULL DEFAULT 0"),
+    ("parity_baseline_items", "output_text_truncated", "INTEGER NOT NULL DEFAULT 0"),
+    ("parity_baseline_items", "param_notes_json", "TEXT NOT NULL DEFAULT '[]'"),
     ("parity_run_items", "tool_calls_json", "TEXT NOT NULL DEFAULT '[]'"),
     ("parity_run_items", "raw_response", "TEXT NOT NULL DEFAULT ''"),
+    ("parity_run_items", "raw_response_truncated", "INTEGER NOT NULL DEFAULT 0"),
+    ("parity_run_items", "output_text_truncated", "INTEGER NOT NULL DEFAULT 0"),
+    ("parity_run_items", "param_notes_json", "TEXT NOT NULL DEFAULT '[]'"),
 ]
 
 
 def query_all(sql: str, params: tuple = ()) -> list[dict]:
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
+    finally:
+        conn.close()
 
 
 def query_one(sql: str, params: tuple = ()) -> dict | None:
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         row = conn.execute(sql, params).fetchone()
         return dict(row) if row else None
+    finally:
+        conn.close()
 
 
 def execute(sql: str, params: tuple = ()) -> int:
     """执行写操作，返回 lastrowid（INSERT）或受影响行数。"""
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         cur = conn.execute(sql, params)
         conn.commit()
         return cur.lastrowid if cur.lastrowid else cur.rowcount
+    finally:
+        conn.close()

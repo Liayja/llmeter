@@ -355,6 +355,8 @@ class LLMBench:
         self._cancelled = False
         self._started_at: float | None = None   # 本轮开始的单调时钟，用于实时速率/ETA
         self._finish_times: list[float] = []     # 各请求完成时刻，用于滑动窗口速率
+        self._retry_events: list[dict] = []      # 最近的重试事件，供 Web 日志展示原因
+        self._retry_seq = 0
         # ── 发压模型：
         #    qps 未设 → 闭环(closed-loop)：Semaphore 限制在途 concurrency 个，
         #               一个回来才补下一个，测「N 路并发下的饱和吞吐/延迟」。
@@ -435,6 +437,8 @@ class LLMBench:
                 self._peak = 0
                 self._completed = 0
                 self._failed = 0
+                self._retry_events = []
+                self._retry_seq = 0
             # 计时从预热之后开始：预热请求不产出结果，若计入会低估速率、放大 ETA
             self._started_at = time.perf_counter()
             self._finish_times = []
@@ -499,14 +503,29 @@ class LLMBench:
     def _emit_progress(self, final: bool = False) -> None:
         """上报进度：有 on_progress 回调则回调，否则打印到终端。
 
-        除了完成数/失败数，还给出**实时速率、平均延迟、已用时、ETA**——
-        闭环模式下 active/peak 稳态就等于并发上限，单看这两个数没有信息量，
-        真正有用的是"跑得多快、还要多久"，以及"峰值有没有达到目标并发"。
+        回调载荷同时包含实时速率、延迟、ETA、成功/失败/重试和 token 吞吐，
+        供 Web 指标面板使用；终端日志不再重复打印 ETA，避免把"估算值"当结果刷屏。
         active/peak 仍然保留：开环模式下它们表示在途积压（判断服务器是否扛得住）。
         """
         now = time.perf_counter()
         elapsed = (now - self._started_at) if self._started_at else 0.0
         ok_results = [r for r in self.results if r.get("success")]
+        success_count = len(ok_results)
+        retried_count = sum(1 for r in self.results if r.get("retried"))
+        input_tokens_total = sum(r.get("input_tokens") or 0 for r in self.results)
+        output_tokens_total = sum(r.get("output_tokens") or 0 for r in self.results)
+        cached_values = [r.get("cached_tokens") for r in self.results
+                         if r.get("cached_tokens") is not None]
+        cached_tokens_total = sum(cached_values)
+        cached_prompt_total = sum(
+            (r.get("input_tokens") or 0) for r in self.results
+            if r.get("cached_tokens") is not None
+        )
+        cache_hit_rate = (
+            min(100.0, cached_tokens_total / cached_prompt_total * 100)
+            if cached_prompt_total > 0 else None
+        )
+        output_tps = (output_tokens_total / elapsed) if elapsed > 0 else 0.0
         ttfts = [r["ttft"] for r in self.results if r.get("ttft") is not None]
         ttft_avg = statistics.mean(ttfts) if ttfts else None
         latencies = [r["latency"] for r in ok_results if r.get("latency")]
@@ -520,10 +539,13 @@ class LLMBench:
         rate = (recent_count / span) if span >= 3 and recent_count > 1 else overall_rate
         remaining = max(self.total_requests - self._completed, 0)
         eta = (remaining / rate) if rate > 0 and self._completed >= 3 else None
+        last_result = self.results[-1] if self.results else {}
         payload = {
             "completed": self._completed,
             "total": self.total_requests,
+            "success": success_count,
             "failed": self._failed,
+            "retried": retried_count,
             "active": self._active,
             "peak": self._peak,
             "mode": "open" if self.qps else "closed",
@@ -535,6 +557,15 @@ class LLMBench:
             "eta": round(eta, 1) if eta is not None else None,
             "avg_latency": latency_avg,
             "ttft_avg": ttft_avg,
+            "input_tokens": input_tokens_total,
+            "output_tokens": output_tokens_total,
+            "output_tps": round(output_tps, 2),
+            "cached_tokens": cached_tokens_total,
+            "cache_hit_rate": round(cache_hit_rate, 1) if cache_hit_rate is not None else None,
+            "last_status": last_result.get("status_code"),
+            "last_error": (last_result.get("error") or "")[:200],
+            "last_retry": self._retry_events[-1] if self._retry_events else None,
+            "retry_events": self._retry_events[-10:],
             "canceled": self._cancelled,
             "final": final,
         }
@@ -545,7 +576,6 @@ class LLMBench:
                 pass  # 回调异常不能影响压测本身
             return
         ttft_str = f"{ttft_avg:.2f}s" if ttft_avg is not None else "—"
-        eta_str = f"{eta:.0f}s" if eta is not None else "计算中"
         if self.qps:
             # 开环：在途/峰值体现积压，是最关键的信号
             state = f"在途 {self._active}(峰值 {self._peak})"
@@ -556,7 +586,8 @@ class LLMBench:
         print(
             f"  ⏳ {self._completed}/{self.total_requests} | "
             f"{state} | {rate:.2f} req/s | "
-            f"TTFT {ttft_str} | ETA {eta_str} | 失败 {self._failed}",
+            f"TTFT {ttft_str} | 成功 {success_count} | 失败 {self._failed} | "
+            f"重试 {retried_count} | 输出 {output_tps:.1f} tok/s",
             flush=True,
         )
 
@@ -689,7 +720,20 @@ class LLMBench:
             # 退避等待后重试
             last_error = result.get("error", "")
             retried = True
-            await asyncio.sleep(self.retry_backoff * (2 ** attempt))
+            backoff = self.retry_backoff * (2 ** attempt)
+            self._retry_seq += 1
+            self._retry_events.append({
+                "seq": self._retry_seq,
+                "request_index": idx,
+                "attempt": attempt + 1,
+                "next_attempt": attempt + 2,
+                "status_code": code,
+                "error": (result.get("error") or "")[:300],
+                "backoff": round(backoff, 2),
+            })
+            if len(self._retry_events) > 50:
+                del self._retry_events[:-50]
+            await asyncio.sleep(backoff)
         return {  # 理论上不会到这里，兜底
             "success": False,
             "latency": 0,

@@ -18,14 +18,34 @@ def set_baseline_status(baseline_id: int, status: str, error: str = "") -> None:
     execute("UPDATE parity_baselines SET status=?, error=? WHERE id=?", (status, error, baseline_id))
 
 
+def mark_stale_tasks() -> None:
+    """清理由服务重启遗留的内存任务状态。"""
+    message = "服务重启，任务已中断；请重新运行"
+    execute(
+        "UPDATE parity_baselines SET status='failed', error=? "
+        "WHERE status IN ('queued','running')",
+        (message,),
+    )
+    execute(
+        "UPDATE parity_runs SET status='failed', error=? "
+        "WHERE status IN ('queued','running')",
+        (message,),
+    )
+
+
 def add_baseline_item(baseline_id: int, item: dict, payload: dict) -> None:
     execute(
         "INSERT INTO parity_baseline_items(baseline_id, case_id, dimension, payload_json,"
-        " output_text, raw_response, tool_calls_json, usage_json, status_code, behavior_class,"
-        " prompt_tokens, completion_tokens, latency, error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " output_text, raw_response, raw_response_truncated, output_text_truncated,"
+        " param_notes_json, tool_calls_json, usage_json, status_code, behavior_class,"
+        " prompt_tokens, completion_tokens, latency, error)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (baseline_id, item["case_id"], item["dimension"],
          json.dumps(payload, ensure_ascii=False), item.get("output_text", ""),
          item.get("raw_response", ""),
+         int(bool(item.get("raw_response_truncated"))),
+         int(bool(item.get("output_text_truncated"))),
+         json.dumps(item.get("param_notes") or [], ensure_ascii=False),
          json.dumps(item.get("tool_calls") or [], ensure_ascii=False),
          json.dumps(item.get("usage") or {}, ensure_ascii=False), item.get("status_code"),
          item.get("behavior_class", ""), item.get("prompt_tokens", 0),
@@ -50,7 +70,8 @@ def get_baseline_items(baseline_id: int) -> dict[str, dict]:
     out = {}
     for r in rows:
         out[r["case_id"]] = {**r, "usage": json.loads(r["usage_json"] or "{}"),
-                             "tool_calls": json.loads(r.get("tool_calls_json") or "[]")}
+                             "tool_calls": json.loads(r.get("tool_calls_json") or "[]"),
+                             "param_notes": json.loads(r.get("param_notes_json") or "[]")}
     return out
 
 
@@ -79,11 +100,15 @@ def update_run(run_id: int, **fields) -> None:
 def add_run_item(run_id: int, item: dict) -> None:
     execute(
         "INSERT INTO parity_run_items(run_id, case_id, dimension, output_text, usage_json,"
-        " raw_response, tool_calls_json, status_code, behavior_class, prompt_tokens,"
-        " completion_tokens, latency, error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " raw_response, raw_response_truncated, output_text_truncated, param_notes_json,"
+        " tool_calls_json, status_code, behavior_class, prompt_tokens,"
+        " completion_tokens, latency, error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (run_id, item["case_id"], item["dimension"], item.get("output_text", ""),
          json.dumps(item.get("usage") or {}, ensure_ascii=False),
          item.get("raw_response", ""),
+         int(bool(item.get("raw_response_truncated"))),
+         int(bool(item.get("output_text_truncated"))),
+         json.dumps(item.get("param_notes") or [], ensure_ascii=False),
          json.dumps(item.get("tool_calls") or [], ensure_ascii=False), item.get("status_code"),
          item.get("behavior_class", ""), item.get("prompt_tokens", 0),
          item.get("completion_tokens", 0), item.get("latency", 0), item.get("error", "")),
@@ -105,5 +130,6 @@ def get_run_items(run_id: int) -> dict[str, dict]:
     out = {}
     for r in rows:
         out[r["case_id"]] = {**r, "usage": json.loads(r["usage_json"] or "{}"),
-                             "tool_calls": json.loads(r.get("tool_calls_json") or "[]")}
+                             "tool_calls": json.loads(r.get("tool_calls_json") or "[]"),
+                             "param_notes": json.loads(r.get("param_notes_json") or "[]")}
     return out
