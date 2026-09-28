@@ -57,6 +57,19 @@ class JobRunner:
         engine.request_cancel()
         return True
 
+    async def shutdown(self) -> None:
+        """应用关闭时取消压测任务，避免 graceful shutdown 长时间等待。"""
+        tasks = [task for task in self._tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+        self._engines.clear()
+        self._cancel_flags.clear()
+        self._subscribers.clear()
+        self._running_task_id = None
+
     async def _run(self, task_id: int, spec: dict) -> None:
         catalog.update_task(task_id, status="running", started_at=now_iso())
         self._publish(task_id, "status", {"status": "running"})
@@ -74,12 +87,17 @@ class JobRunner:
                     is_cancelled=lambda: self._cancel_flags.get(task_id, False))
                 status = "canceled" if result.get("canceled") else "success"
                 totals = {k: result.get(k, 0) for k in ("total", "success", "fail")}
+                group_totals = {
+                    k: result.get(k, 0)
+                    for k in ("groups_total", "groups_clean", "groups_failed")
+                }
             else:
                 result = await runner_bridge.run_chat(spec, on_progress=on_progress,
                                                       on_engine=on_engine)
                 metrics = result["metrics"]
                 status = "canceled" if metrics.get("canceled") else "success"
                 totals = {k: metrics.get(k, 0) for k in ("total", "success", "fail")}
+                group_totals = {}
             catalog.update_task(
                 task_id, status=status, total=totals["total"], success=totals["success"],
                 fail=totals["fail"], result_dir=result.get("result_dir"),
@@ -87,12 +105,20 @@ class JobRunner:
                 finished_at=now_iso(),
             )
             self._publish(task_id, "status", {
-                "status": status, **totals, "excel_path": result.get("excel_path"),
+                "status": status, **totals, **group_totals,
+                "excel_path": result.get("excel_path"),
             })
         except Exception as e:      # noqa: BLE001
             catalog.update_task(task_id, status="failed", error=str(e), finished_at=now_iso())
             self._publish(task_id, "error", {"message": str(e)})
             self._publish(task_id, "status", {"status": "failed", "error": str(e)})
+        except asyncio.CancelledError:
+            catalog.update_task(
+                task_id, status="canceled", error="服务关闭，任务已中止",
+                finished_at=now_iso(),
+            )
+            self._publish(task_id, "status", {"status": "canceled"})
+            raise
         finally:
             self._engines.pop(task_id, None)
             self._cancel_flags.pop(task_id, None)

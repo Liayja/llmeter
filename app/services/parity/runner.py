@@ -153,6 +153,16 @@ def recover_stale_tasks() -> None:
     store.mark_stale_tasks()
 
 
+async def shutdown() -> None:
+    """应用关闭时取消仍在运行的一致性任务。"""
+    tasks = [task for task in _tasks.values() if not task.done()]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _tasks.clear()
+
+
 def dimension_catalog() -> list[dict]:
     return [{"id": k, "name": v["name"], "weight": v["weight"],
              "cases": len(v["cases"])} for k, v in DIMENSIONS.items()]

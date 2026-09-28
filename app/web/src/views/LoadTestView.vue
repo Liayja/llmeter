@@ -212,14 +212,18 @@ function onStatus(data) {
   } else if (data.status === "success") {
     running.value = false;
     const isScenario = mode.value === "scenarios";
+    const groupsTotal = data.groups_total ?? data.total ?? 0;
+    const groupsClean = data.groups_clean ?? data.success ?? 0;
     statusText.value = isScenario
-      ? `完成：${data.success ?? 0}/${data.total ?? 0} 组无失败`
+      ? `完成：请求成功 ${data.success ?? 0}/${data.total ?? 0}，无失败场景 ${groupsClean}/${groupsTotal}`
       : `完成：成功 ${data.success ?? progress.success}/${data.total ?? progress.total}`;
     appendLog(
       isScenario
-        ? `任务完成 | 组合无失败 ${data.success ?? 0}/${data.total ?? 0}` +
+        ? `任务完成 | 请求成功 ${data.success ?? 0}/${data.total ?? 0}` +
+          ` | 请求失败 ${data.fail ?? progress.failed}` +
+          ` | 无失败场景 ${groupsClean}/${groupsTotal}` +
           ` | 最后场景请求成功 ${progress.success}/${progress.completed}` +
-          ` | 失败 ${progress.failed} | 重试 ${progress.retried}` +
+          ` | 重试 ${progress.retried}` +
           ` | 耗时 ${format(progress.elapsed, 1)}s`
         : `任务完成 | 成功 ${data.success ?? progress.success}/${data.total ?? progress.total}` +
           ` | 失败 ${progress.failed} | 重试 ${progress.retried}` +

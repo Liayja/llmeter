@@ -32,6 +32,8 @@ onMounted(async () => {
       <el-menu :default-active="route.path" router :collapse="collapsed" class="menu">
         <el-menu-item index="/loadtest"><span>压测</span></el-menu-item>
         <el-menu-item index="/parity"><span>一致性基准</span></el-menu-item>
+        <el-menu-item index="/multimodal"><span>多模态测试</span></el-menu-item>
+        <el-menu-item index="/route-probe"><span>路由检测</span></el-menu-item>
         <el-menu-item index="/assets"><span>资产库</span></el-menu-item>
         <el-menu-item index="/results"><span>结果</span></el-menu-item>
       </el-menu>

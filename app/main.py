@@ -1,5 +1,7 @@
 """平台入口：python -m app.main [--port 8781]"""
 import argparse
+import asyncio
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
@@ -7,18 +9,43 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from .db import init_db
-from .routers import connections, models, parity, prompts, results, scenarios, tasks
+from .routers import connections, models, multimodal, parity, prompts, results, route_probe, scenarios, tasks
 from .services.parity import runner as parity_runner
+from .services.multimodal import runner as mm_runner
+from .services.job_runner import runner as job_runner
+from .services.route_probe import runner as route_probe_runner
 from .services import key_store
 from .settings import DEFAULT_HOST, DEFAULT_PORT, STATIC_DIR, WEB_DIST_DIR
 
-app = FastAPI(title="llmeter 压测平台", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """启动恢复 + 关闭时主动取消后台任务，避免 Ctrl+C 长时间等待。"""
+    init_db()
+    parity_runner.recover_stale_tasks()
+    mm_runner.recover_stale_runs()
+    route_probe_runner.recover_stale_runs()
+    try:
+        yield
+    finally:
+        await job_runner.shutdown()
+        await asyncio.gather(
+            parity_runner.shutdown(),
+            mm_runner.shutdown(),
+            route_probe_runner.shutdown(),
+            return_exceptions=True,
+        )
+
+
+app = FastAPI(title="llmeter 压测平台", version="0.1.0", lifespan=lifespan)
 
 app.include_router(connections.router)
 app.include_router(models.router)
 app.include_router(prompts.router)
 app.include_router(scenarios.router)
+app.include_router(multimodal.router)
 app.include_router(parity.router)
+app.include_router(route_probe.router)
 app.include_router(tasks.router)
 app.include_router(results.router)
 
@@ -27,12 +54,6 @@ app.include_router(results.router)
 def health() -> JSONResponse:
     warning = key_store.fallback_warning()
     return JSONResponse({"ok": True, "warning": warning})
-
-
-@app.on_event("startup")
-def _startup() -> None:
-    init_db()
-    parity_runner.recover_stale_tasks()
 
 
 # 静态前端（放在最后 mount，避免遮蔽 /api）
@@ -62,7 +83,13 @@ def main() -> None:
         print("   - Vue3 frontend enabled; legacy UI: /legacy")
     else:
         print("   - app/web/dist not found; legacy UI enabled")
-    uvicorn.run("app.main:app", host=args.host, port=args.port, reload=args.reload)
+    uvicorn.run(
+        "app.main:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+        timeout_graceful_shutdown=5,
+    )
 
 
 if __name__ == "__main__":

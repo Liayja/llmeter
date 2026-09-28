@@ -255,6 +255,9 @@ async def run_scenarios(spec: dict, on_progress=None, on_engine=None,
         summary_path = str(comparison_json)
         result_dir = str(date_dir)
 
+    groups_total = len(rows)
+    groups_clean = sum(1 for r in rows if r.get("fail", 0) == 0)
+    groups_failed = sum(1 for r in rows if r.get("fail", 0) > 0)
     return {
         "mode": "scenarios",
         "rows": rows,
@@ -262,7 +265,12 @@ async def run_scenarios(spec: dict, on_progress=None, on_engine=None,
         "excel_path": excel_path,
         "result_dir": result_dir,
         "canceled": canceled,
-        "total": len(rows),
-        "success": sum(1 for r in rows if r.get("fail", 0) == 0),
-        "fail": sum(1 for r in rows if r.get("fail", 0) > 0),
+        # 请求级统计：任务历史里的“成功/总数”应表示真实请求数。
+        "total": sum(int(r.get("total", 0) or 0) for r in rows),
+        "success": sum(int(r.get("success", 0) or 0) for r in rows),
+        "fail": sum(int(r.get("fail", 0) or 0) for r in rows),
+        # 场景组合级统计：用于区分“任务完成”与“所有场景请求都成功”。
+        "groups_total": groups_total,
+        "groups_clean": groups_clean,
+        "groups_failed": groups_failed,
     }

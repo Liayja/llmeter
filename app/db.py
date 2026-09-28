@@ -141,6 +141,118 @@ CREATE TABLE IF NOT EXISTS parity_run_items (
     latency REAL NOT NULL DEFAULT 0,
     error TEXT NOT NULL DEFAULT ''
 );
+
+-- ── 多模态能力测试（独立模块，与压测无关）──
+CREATE TABLE IF NOT EXISTS mm_media (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,                  -- image / video
+    source_type TEXT NOT NULL,           -- local / remote
+    mime_type TEXT NOT NULL DEFAULT '',
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    sha256 TEXT NOT NULL DEFAULT '',
+    local_path TEXT NOT NULL DEFAULT '',
+    remote_url TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mm_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    model_id INTEGER,
+    model_label TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    connection_id INTEGER,
+    media_id INTEGER,
+    media_kind TEXT NOT NULL DEFAULT '',
+    input_mode TEXT NOT NULL DEFAULT 'auto',
+    prompt TEXT NOT NULL DEFAULT '',
+    expected_keywords_json TEXT NOT NULL DEFAULT '[]',
+    config_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'queued', -- queued/running/finished/failed/canceled
+    verdict TEXT NOT NULL DEFAULT '',
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS mm_run_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    request_json TEXT NOT NULL DEFAULT '{}',
+    raw_response TEXT NOT NULL DEFAULT '',
+    raw_response_truncated INTEGER NOT NULL DEFAULT 0,
+    output_text TEXT NOT NULL DEFAULT '',
+    output_text_truncated INTEGER NOT NULL DEFAULT 0,
+    request_size_bytes INTEGER NOT NULL DEFAULT 0,
+    usage_json TEXT NOT NULL DEFAULT '{}',
+    status_code INTEGER,
+    behavior_class TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    latency REAL NOT NULL DEFAULT 0,
+    ttft REAL,
+    verdict TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT ''
+);
+
+-- ── 路由指纹检测（黑盒推断，不依赖上游渠道 ID）──
+CREATE TABLE IF NOT EXISTS route_probe_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    model_id INTEGER,
+    model_label TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    connection_id INTEGER,
+    preset TEXT NOT NULL DEFAULT 'quick',
+    config_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'queued',
+    verdict TEXT NOT NULL DEFAULT '',
+    confidence INTEGER NOT NULL DEFAULT 0,
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS route_probe_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    sequence INTEGER NOT NULL,
+    concurrency INTEGER NOT NULL DEFAULT 1,
+    client_request_id TEXT NOT NULL DEFAULT '',
+    phase TEXT NOT NULL DEFAULT '',
+    status_code INTEGER,
+    error_type TEXT NOT NULL DEFAULT '',
+    error_phase TEXT NOT NULL DEFAULT '',
+    response_received INTEGER NOT NULL DEFAULT 0,
+    remote_ip TEXT NOT NULL DEFAULT '',
+    http_version TEXT NOT NULL DEFAULT '',
+    ttfe_ms REAL,
+    ttft_ms REAL,
+    latency_ms REAL NOT NULL DEFAULT 0,
+    request_size_bytes INTEGER NOT NULL DEFAULT 0,
+    response_headers_json TEXT NOT NULL DEFAULT '{}',
+    response_model TEXT NOT NULL DEFAULT '',
+    system_fingerprint TEXT NOT NULL DEFAULT '',
+    response_id TEXT NOT NULL DEFAULT '',
+    id_prefix TEXT NOT NULL DEFAULT '',
+    usage_json TEXT NOT NULL DEFAULT '{}',
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    finish_reason TEXT NOT NULL DEFAULT '',
+    output_hash TEXT NOT NULL DEFAULT '',
+    logprobs_hash TEXT NOT NULL DEFAULT '',
+    logprobs_available INTEGER NOT NULL DEFAULT 0,
+    request_json TEXT NOT NULL DEFAULT '{}',
+    raw_response TEXT NOT NULL DEFAULT '',
+    raw_response_truncated INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -186,6 +298,11 @@ _COLUMN_MIGRATIONS = [
     ("parity_run_items", "raw_response_truncated", "INTEGER NOT NULL DEFAULT 0"),
     ("parity_run_items", "output_text_truncated", "INTEGER NOT NULL DEFAULT 0"),
     ("parity_run_items", "param_notes_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("mm_run_items", "request_size_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    ("route_probe_attempts", "response_id", "TEXT NOT NULL DEFAULT ''"),
+    ("route_probe_attempts", "id_prefix", "TEXT NOT NULL DEFAULT ''"),
+    ("route_probe_attempts", "logprobs_hash", "TEXT NOT NULL DEFAULT ''"),
+    ("route_probe_attempts", "logprobs_available", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 

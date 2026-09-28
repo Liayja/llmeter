@@ -78,6 +78,26 @@ export const getParityRun = (id) => api.get(`/api/parity/runs/${id}`);
 export const cancelParityRun = (id) => api.post(`/api/parity/runs/${id}/cancel`);
 export const parityMarkdown = (id) => api.get(`/api/parity/runs/${id}/markdown`);
 
+// 多模态能力测试
+export const multimodalMedia = () => api.get("/api/mm/media");
+export const createLocalMedia = (body) => api.post("/api/mm/media/local", body);
+export const createRemoteMedia = (body) => api.post("/api/mm/media/url", body);
+export const deleteMedia = (id) => api.del(`/api/mm/media/${id}`);
+export const createMultimodalRun = (body) => api.post("/api/mm/runs", body);
+export const multimodalRuns = () => api.get("/api/mm/runs");
+export const getMultimodalRun = (id) => api.get(`/api/mm/runs/${id}`);
+export const cancelMultimodalRun = (id) => api.post(`/api/mm/runs/${id}/cancel`);
+
+// 路由指纹检测
+export const routeProbePresets = () => api.get("/api/route-probe/presets");
+export const routeProbeRuns = () => api.get("/api/route-probe/runs");
+export const createRouteProbeRun = (body) => api.post("/api/route-probe/runs", body);
+export const getRouteProbeRun = (id, limit = 1000) =>
+  api.get(`/api/route-probe/runs/${id}?attempts_limit=${limit}`);
+export const cancelRouteProbeRun = (id) => api.post(`/api/route-probe/runs/${id}/cancel`);
+export const routeProbeMarkdown = (id) => api.get(`/api/route-probe/runs/${id}/markdown`);
+export const getRouteProbeAttempt = (id) => api.get(`/api/route-probe/attempts/${id}`);
+
 // 结果
 export const getResult = (id) => api.get(`/api/results/${id}`);
 export const resultDownloadUrl = (id, kind = "json") =>

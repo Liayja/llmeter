@@ -24,6 +24,17 @@ const mapped = computed(() => {
     yellow: ["可疑", "warning"],
     red: ["不通过", "danger"],
     gray: ["不可判断", "info"],
+    accepted: ["已接受", "success"],
+    partial: ["部分通过", "warning"],
+    rejected: ["已拒绝", "danger"],
+    error: ["请求错误", "danger"],
+    SINGLE_ROUTE: ["单一指纹", "success"],
+    MULTI_ROUTE_LIKELY: ["疑似多路由", "warning"],
+    MULTI_ROUTE_SUSPECTED: ["多路由待确认", "warning"],
+    MULTI_INSTANCE_LIKELY: ["疑似多实例", "warning"],
+    EDGE_VARIANCE_LIKELY: ["入口波动", "warning"],
+    CLIENT_OR_GATEWAY_UNSTABLE: ["客户端/网关不稳定", "danger"],
+    INCONCLUSIVE: ["无法判断", "info"],
     ...props.labels,
   };
   return table[v] || [v || "—", "info"];
